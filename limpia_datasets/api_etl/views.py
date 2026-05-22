@@ -125,16 +125,35 @@ class ProcesarFamososView(APIView):
                     nombres_unicos.remove(nombre_final)
                     continue
             else:
+                # parseo estricto estándar (si viene con formato normal DD-MM-YYYY o YYYY-MM-DD)
                 fecha_normalizada = fecha_raw.replace('/', '-')
                 try:
                     dt_nacimiento = datetime.strptime(fecha_normalizada, "%Y-%m-%d")
+                    fecha_chile = dt_nacimiento.strftime("%d-%m-%Y")
+                    edad = anho_actual - dt_nacimiento.year - ((mes_actual, dia_actual) < (dt_nacimiento.month, dt_nacimiento.day))
+                    es_cumpleanos = (mes_actual == dt_nacimiento.month and dia_actual == dt_nacimiento.day)
                 except ValueError:
                     try:
                         dt_nacimiento = datetime.strptime(fecha_normalizada, "%d-%m-%Y")
+                        fecha_chile = dt_nacimiento.strftime("%d-%m-%Y")
+                        edad = anho_actual - dt_nacimiento.year - ((mes_actual, dia_actual) < (dt_nacimiento.month, dt_nacimiento.day))
+                        es_cumpleanos = (mes_actual == dt_nacimiento.month and dia_actual == dt_nacimiento.day)
                     except ValueError:
-                        logs.append(f"[{datetime.now().strftime('%X')}][LÍNEA {idx}] Imposible parsear fecha '{fecha_raw}'. Omitido.")
-                        nombres_unicos.remove(nombre_final)
-                        continue
+                        
+                        # REFUERZO: Si falla el parseo estricto, buscamos un año suelto (ej: "alrededor de 1028")
+                        match_anho = re.search(r'\b\d{3,4}\b', fecha_raw) # Busca un número de 3 o 4 dígitos
+                        if match_anho:
+                            anho_extraido = int(match_anho.group())
+                            fecha_chile = f"01-01-{anho_extraido:04d}" # Formato por defecto para años incompletos
+                            edad = anho_actual - anho_extraido
+                            es_cumpleanos = (mes_actual == 1 and dia_actual == 1)
+                            
+                            logs.append(f"[{datetime.now().strftime('%X')}][LÍNEA {idx}] PARSEO REPARADO: Se extrajo el año '{anho_extraido}' del texto sucio '{fecha_raw}'.")
+                        else:
+                            # Si no hay ningún año numérico, se descarta
+                            logs.append(f"[{datetime.now().strftime('%X')}][LÍNEA {idx}] Imposible parsear fecha '{fecha_raw}'. Omitido.")
+                            nombres_unicos.remove(nombre_final)
+                            continue
 
                 fecha_chile = dt_nacimiento.strftime("%d-%m-%Y")
                 edad = anho_actual - dt_nacimiento.year - ((mes_actual, dia_actual) < (dt_nacimiento.month, dt_nacimiento.day))
@@ -150,7 +169,7 @@ class ProcesarFamososView(APIView):
             famosos_creados.append(famoso_obj)
             
             if famoso_obj.fecha_nacimiento_original != famoso_obj.fecha_nacimiento_chile:
-                logs.append(f"[{datetime.now().strftime('%X')}][LÍNEA {idx}] NORMALIZADO: '{famoso_obj.nombre}' - Fecha ajustada a formato chileno.")
+                logs.append(f"[{datetime.now().strftime('%X')}][LÍNEA {idx}] NORMALIZADO: '{famoso_obj.nombre}' - Fecha ajustada a formato (DD-MM-YYYY).")
 
         # Aplicar ordenamiento por nombre si viene el flag activo
         if debe_ordenar:
