@@ -280,8 +280,8 @@ class ProcesarLugaresView(APIView):
         serializer = LugarDetalleSerializer(lugares_procesados, many=True)
         return Response({"logs": logs, "data": serializer.data})
     
-# =====================================================================
-# VISTA PARTE 1: PROCESADOR DE COMUNAS OPTIMIZADO (BULK PIPELINE)
+    
+    # VISTA PARTE 1: PROCESADOR DE COMUNAS ULTRA-OPTIMIZADO (CACHE EN RAM)
 # =====================================================================
 class ProcesarComunasView(APIView):
     parser_classes = [MultiPartParser]
@@ -301,12 +301,12 @@ class ProcesarComunasView(APIView):
         if not archivo_sucio:
             return Response({"error": "No se ha subido ningún archivo para procesar"}, status=400)
 
-        t_inicio = time.time() # Medidor de rendimiento para los logs
+        t_inicio = time.time()
         logs = []
         comunas_finales_proceso = []
         comunas_unicas_procesadas = set()
 
-        logs.append(f"=== ETL COMUNAS OPTIMIZADO INICIADO (Sensibilidad FUZZ: {int(sensibilidad*100)}%) ===")
+        logs.append(f"=== ETL COMUNAS OPTIMIZADO INICIADO (Sensibilidad: {int(sensibilidad*100)}%) ===")
 
         # 1. Obtener o crear el Diccionario Padre
         diccionario_obj, _ = DiccionarioReferencia.objects.get_or_create(
@@ -314,11 +314,9 @@ class ProcesarComunasView(APIView):
             defaults={"descripcion": "Listado maestro de comunas normalizadas."}
         )
 
-        # 2. OPTIMIZACIÓN 1: Inserción masiva de comunas oficiales (si se subió el archivo)
+        # 2. Inserción masiva de oficiales (si viene el archivo)
         if archivo_oficial:
-            logs.append(f"[{datetime.now().strftime('%X')}] Actualizando diccionario maestro...")
             TerminoValido.objects.filter(diccionario=diccionario_obj).delete()
-            
             nuevos_terminos_oficiales = []
             oficiales_unicos = set()
 
@@ -328,24 +326,20 @@ class ProcesarComunasView(APIView):
                     comuna_of_norm = limpiar_texto_basico(linea_of_str)
                     if comuna_of_norm not in oficiales_unicos:
                         oficiales_unicos.add(comuna_of_norm)
-                        # Creamos el objeto en memoria, NO en la base de datos todavía
                         nuevos_terminos_oficiales.append(
                             TerminoValido(diccionario=diccionario_obj, valor_oficial=comuna_of_norm)
                         )
-            
-            # Un solo INSERT masivo para todo el archivo oficial (en bloques de 1000)
             TerminoValido.objects.bulk_create(nuevos_terminos_oficiales, batch_size=1000)
-            logs.append(f"[{datetime.now().strftime('%X')}] Diccionario maestro poblado en bloque con {len(nuevos_terminos_oficiales)} comunas.")
 
-        # 3. OPTIMIZACIÓN 2: Cargar TODO el diccionario de la BD a la memoria RAM de una sola vez
-        # Traemos tanto el set para el algoritmo fuzz como los registros existentes para evitar duplicaciones reales en la BD
+        # 3. TURBO OPTIMIZACIÓN: Crear un mapa en caché para evitar re-calcular Fuzzy repetido
         lista_oficial_bd = list(TerminoValido.objects.filter(diccionario=diccionario_obj).values_list('valor_oficial', flat=True))
         set_oficiales_existentes = set(lista_oficial_bd)
-
-        # Colección para hacer bulk_create del archivo sucio
+        
+        # Este diccionario recordará los resultados ya calculados (O(1) de velocidad)
+        cache_fuzz = {}
         nuevos_registros_bd = []
 
-        # 4. PROCESAR EL DATASET SUCIO EN MEMORIA RAM
+        # 4. PROCESAR EL DATASET MASIVO
         for idx, linea in enumerate(archivo_sucio, start=1):
             linea_str = decodificar_linea(linea)
             if not linea_str or "comuna" in linea_str.lower():
@@ -353,40 +347,33 @@ class ProcesarComunasView(APIView):
 
             comuna_limpia_inicial = limpiar_texto_basico(linea_str)
 
-            # buscar_fuzz ahora opera contra 'lista_oficial_bd' que está alojada en la RAM
-            comuna_final, corregido_fuzz = buscar_fuzz(comuna_limpia_inicial, lista_oficial_bd, cutoff=sensibilidad)
+            # Si ya calculamos esta palabra antes, la sacamos de la RAM instantáneamente sin usar CPU
+            if comuna_limpia_inicial in cache_fuzz:
+                comuna_final, corregido_fuzz = cache_fuzz[comuna_limpia_inicial]
+            else:
+                # Solo calcula la distancia matemática si es una palabra nueva
+                comuna_final, corregido_fuzz = buscar_fuzz(comuna_limpia_inicial, lista_oficial_bd, cutoff=sensibilidad)
+                cache_fuzz[comuna_limpia_inicial] = (comuna_final, corregido_fuzz)
 
-            if corregido_fuzz:
-                logs.append(f"[{datetime.now().strftime('%X')}][LÍNEA {idx}] FUZZ CORRECCIÓN: '{linea_str.strip()}' -> '{comuna_final}'")
-
-            # Evitar duplicados en la respuesta del usuario
             if comuna_final in comunas_unicas_procesadas:
-                logs.append(f"[{datetime.now().strftime('%X')}][LÍNEA {idx}] DUPLICADO RECHAZADO: '{comuna_final}' ya procesado en este lote.")
                 continue
 
             comunas_unicas_procesadas.add(comuna_final)
             comunas_finales_proceso.append({"id": idx, "valor_oficial": comuna_final})
 
-            # OPTIMIZACIÓN 3: Si la comuna limpia no existía previamente en la base de datos, 
-            # la preparamos para inserción masiva en bloque
             if comuna_final not in set_oficiales_existentes:
                 set_oficiales_existentes.add(comuna_final)
                 nuevos_registros_bd.append(
                     TerminoValido(diccionario=diccionario_obj, valor_oficial=comuna_final)
                 )
 
-            if not corregido_fuzz and linea_str.strip() != comuna_final:
-                logs.append(f"[{datetime.now().strftime('%X')}][LÍNEA {idx}] CORREGIDO FORMATO: '{linea_str.strip()}' -> '{comuna_final}'")
-
-        # 5. Ejecutar la inserción masiva en bloque de los registros faltantes
+        # 5. Guardado en bloques optimizados
         if nuevos_registros_bd:
             TerminoValido.objects.bulk_create(nuevos_registros_bd, batch_size=1000)
-            logs.append(f"[{datetime.now().strftime('%X')}] Guardado en bloque: {len(nuevos_registros_bd)} nuevos términos persistidos en Postgres.")
 
         if debe_ordenar:
             comunas_finales_proceso.sort(key=lambda x: x["valor_oficial"])
 
         t_total = time.time() - t_inicio
         logs.append(f"=== ETL COMUNAS FINALIZADO EXITOSAMENTE EN {t_total:.4f} SEGUNDOS ===")
-
         return Response({"logs": logs, "data": comunas_finales_proceso})
