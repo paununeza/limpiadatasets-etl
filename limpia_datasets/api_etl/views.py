@@ -333,8 +333,8 @@ class ProcesarComunasView(APIView):
                             TerminoValido(diccionario=diccionario_obj, valor_oficial=comuna_of_norm)
                         )
             
-            # Un solo INSERT masivo para todo el archivo oficial
-            TerminoValido.objects.bulk_create(nuevos_terminos_oficiales)
+            # Un solo INSERT masivo para todo el archivo oficial (en bloques de 1000)
+            TerminoValido.objects.bulk_create(nuevos_terminos_oficiales, batch_size=1000)
             logs.append(f"[{datetime.now().strftime('%X')}] Diccionario maestro poblado en bloque con {len(nuevos_terminos_oficiales)} comunas.")
 
         # 3. OPTIMIZACIÓN 2: Cargar TODO el diccionario de la BD a la memoria RAM de una sola vez
@@ -380,7 +380,7 @@ class ProcesarComunasView(APIView):
 
         # 5. Ejecutar la inserción masiva en bloque de los registros faltantes
         if nuevos_registros_bd:
-            TerminoValido.objects.bulk_create(nuevos_registros_bd)
+            TerminoValido.objects.bulk_create(nuevos_registros_bd, batch_size=1000)
             logs.append(f"[{datetime.now().strftime('%X')}] Guardado en bloque: {len(nuevos_registros_bd)} nuevos términos persistidos en Postgres.")
 
         if debe_ordenar:
