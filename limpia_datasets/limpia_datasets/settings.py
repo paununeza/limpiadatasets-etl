@@ -22,7 +22,8 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 SECRET_KEY = os.environ.get('SECRET_KEY', 'django-insecure-clave-de-respaldo-local-super-secreta')
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
+# En producción se apaga automáticamente para proteger el servidor
+DEBUG = os.environ.get('RENDER', 'False') == 'True' or False
 
 ALLOWED_HOSTS = ['*']
 
