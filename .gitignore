@@ -1,0 +1,13 @@
+# Django (Backend)
+*.sqlite3
+limpia_datasets/db.sqlite3
+__pycache__/
+*.pyc
+.env
+v_env/
+env/
+
+# React (Frontend)
+cliente-etl/node_modules/
+cliente-etl/dist/
+.DS_Store
