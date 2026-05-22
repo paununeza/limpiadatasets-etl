@@ -229,13 +229,7 @@ export default function App() {
                         <td style={{color: 'white', fontWeight: 'bold'}}>{f.nombre}</td>
                         <td>{f.fecha_nacimiento_chile}</td>
                         <td style={{color: '#10b981', fontWeight: 'bold'}}>{f.edad}</td>
-                        <td>
-                          {f.es_cumpleanos ? (
-                            <span className="badge-cumpleanos">SÍ</span>
-                          ) : (
-                            <span className="badge-normal">NO</span>
-                          )}
-                        </td>
+                        <td>{f.es_cumpleanos ? '🎉 SÍ' : 'NO'}</td>
                       </tr>
                     ))}
                   </tbody>
