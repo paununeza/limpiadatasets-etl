@@ -370,10 +370,23 @@ class ProcesarComunasView(APIView):
         # 5. Guardado en bloques optimizados
         if nuevos_registros_bd:
             TerminoValido.objects.bulk_create(nuevos_registros_bd, batch_size=1000)
+            logs.append(f"[{datetime.now().strftime('%X')}] Base de datos: Se persistieron {len(nuevos_registros_bd)} términos nuevos en Neon Postgres.")
+        else:
+            logs.append(f"[{datetime.now().strftime('%X')}] Base de datos: No se detectaron términos nuevos para guardar.")
+
+        # MÉTRICAS
+        total_lineas_leidas = idx
+        total_unicas = len(comunas_unicas_procesadas)
+        total_duplicados = total_lineas_leidas - total_unicas
+
+        logs.append(f"[{datetime.now().strftime('%X')}] Análisis: Se procesaron {total_lineas_leidas} filas totales.")
+        logs.append(f"[{datetime.now().strftime('%X')}] Filtro Duplicados: Se redujo el set a {total_unicas} comunas únicas (Omitidos: {total_duplicados} registros repetidos).")
+        logs.append(f"[{datetime.now().strftime('%X')}] Caché RAM: {len(cache_fuzz)} combinaciones Fuzzy calculadas y almacenadas en Hash Map.")
 
         if debe_ordenar:
             comunas_finales_proceso.sort(key=lambda x: x["valor_oficial"])
 
         t_total = time.time() - t_inicio
-        logs.append(f"=== ETL COMUNAS FINALIZADO EXITOSAMENTE EN {t_total:.4f} SEGUNDOS ===")
+        logs.append(f"=== ETL COMUNAS FINALIZADO EXITOSAMENTE EN {t_total:.2f} SEGUNDOS ===")
+
         return Response({"logs": logs, "data": comunas_finales_proceso})
