@@ -12,7 +12,8 @@ sqlparse==0.5.3
 gunicorn==23.0.0
 whitenoise==6.11.0
 
-# Utilidades de Datos y Fechas
+# Utilidades de Datos, Fechas y Variables de Entorno
 pytz==2025.2
 tzdata==2025.2
 asgiref==3.9.1
+python-dotenv==1.0.1
