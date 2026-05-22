@@ -218,7 +218,7 @@ export default function App() {
                   <thead>
                     <tr>
                       <th>Nombre</th>
-                      <th>Fecha Chile</th>
+                      <th>Fecha (DD-MM-YYYY)</th>
                       <th>Edad</th>
                       <th>¿Cumpleaños?</th>
                     </tr>
@@ -229,7 +229,13 @@ export default function App() {
                         <td style={{color: 'white', fontWeight: 'bold'}}>{f.nombre}</td>
                         <td>{f.fecha_nacimiento_chile}</td>
                         <td style={{color: '#10b981', fontWeight: 'bold'}}>{f.edad}</td>
-                        <td>{f.es_cumpleanos ? '🎉 SÍ' : 'NO'}</td>
+                        <td>
+                          {f.es_cumpleanos ? (
+                            <span className="badge-cumpleanos">SÍ</span>
+                          ) : (
+                            <span className="badge-normal">NO</span>
+                          )}
+                        </td>
                       </tr>
                     ))}
                   </tbody>
