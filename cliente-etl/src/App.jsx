@@ -35,10 +35,17 @@ export default function App() {
       formData.append('archivo_oficial', archivoOficial);
     }
 
+    // Mapeo dinámico de endpoints del backend en Django (PRODUCCIÓN)
+    let url = 'https://limpiadatasets-etl.onrender.com/api/etl/comunas/';
+    if (pestana === 'famosos') url = 'https://limpiadatasets-etl.onrender.com/api/etl/famosos/';
+    if (pestana === 'lugares') url = 'https://limpiadatasets-etl.onrender.com/api/etl/lugares/';
+
+/* 
     // Mapeo dinámico de endpoints del backend en Django
     let url = 'http://localhost:8000/api/etl/comunas/';
     if (pestana === 'famosos') url = 'http://localhost:8000/api/etl/famosos/';
     if (pestana === 'lugares') url = 'http://localhost:8000/api/etl/lugares/';
+*/
 
     try {
       const respuesta = await axios.post(url, formData, {
