@@ -106,7 +106,7 @@ export default function App() {
   return (
     <div>
       <header>
-        <h2>Plataforma ETL &amp; Arquitectura de Datos</h2>
+        <h2>App LimpiaDatasets</h2>
         <span style={{color: '#9ca3af', fontSize: '12px'}}>v1.5.0 (Producción Completa)</span>
       </header>
 
@@ -133,7 +133,7 @@ export default function App() {
                 <label style={{ color: '#10b981', fontWeight: 'bold' }}>Listado Oficial de Referencia (.txt) - Opcional</label>
                 <input type="file" accept=".txt" onChange={(e) => setArchivoOficial(e.target.files[0])} />
                 <small style={{ color: '#6b7280', display: 'block', marginTop: '4px', lineHeight: '1.3' }}>
-                  Sube el diccionario maestro para calibrar el algoritmo difuso.
+                  Sube el diccionario para calibrar el algoritmo difuso.
                 </small>
               </div>
             )}
@@ -142,7 +142,7 @@ export default function App() {
               <label>Formato de Salida</label>
               <select value={formato} onChange={(e) => setFormato(e.target.value)}>
                 <option value=".txt">Texto Plano (.txt)</option>
-                <option value=".csv">CSV Chileno (;)</option>
+                <option value=".csv">CSV (;)</option>
                 <option value=".json">JSON (.json)</option>
               </select>
             </div>
