@@ -18,3 +18,4 @@ tzdata==2025.2
 asgiref==3.9.1
 python-dotenv==1.0.1
 python-dateutil==2.9.0.post0
+requests==2.31.0
