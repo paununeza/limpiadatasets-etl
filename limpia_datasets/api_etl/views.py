@@ -53,9 +53,65 @@ def buscar_fuzz(texto_normalizado, lista_oficial, cutoff=0.75):
 
 def consultar_api_comuna(nombre_comuna):
     """
+    Se conecta a la API de Wikipedia para obtener la Región y Habitantes.
+    Implementa un sistema de re-intento flexible si el título estricto falla.
+    """
+    url_api = "https://es.wikipedia.org/w/api.php"
+    
+    # Lista de variantes de títulos para buscar en Wikipedia en orden de probabilidad
+    variantes_busqueda = [
+        f"Comuna de {nombre_comuna}",
+        nombre_comuna,
+        f"{nombre_comuna} (Chile)"
+    ]
+    
+    region = "No Encontrada"
+    habitantes = None
+    
+    for titulo in variantes_busqueda:
+        params = {
+            "action": "query",
+            "format": "json",
+            "prop": "extracts",
+            "exintro": True,
+            "explaintext": True,
+            "titles": titulo,
+            "redirects": 1
+        }
+        
+        try:
+            respuesta = requests.get(url_api, params=params, timeout=5)
+            datos = respuesta.json()
+            paginas = datos.get("query", {}).get("pages", {})
+            
+            for pid, pinfo in paginas.items():
+                if pid != "-1":  # Si la página existe en Wikipedia
+                    texto_intro = pinfo.get("extract", "")
+                    
+                    # 1. Extracción de la Región
+                    match_region = re.search(r'región d[e|el|as]\s+([A-ZÁÉÍÓÚa-záéíóú\s]+?)(?=[,\.]|$)', texto_intro, re.IGNORECASE)
+                    if match_region:
+                        region = match_region.group(1).strip().title()
+                    
+                    # 2. Extracción de habitantes
+                    match_hab = re.search(r'(\d+[\.\s]?\d*[\.\s]?\d*)\s+habitantes', texto_intro, re.IGNORECASE)
+                    if match_hab:
+                        num_limpio = re.sub(r'[\.\s]', '', match_hab.group(1))
+                        habitantes = int(num_limpio)
+                        
+                    # Si encontramos datos válidos, rompemos el bucle y los devolvemos
+                    return region, habitantes
+        except Exception:
+            pass # Si falla una variante, intenta la siguiente
+            
+    return region, habitantes
+
+"""version anterior sin reintentos flexibles:
+def consultar_api_comuna(nombre_comuna):
+    
     Se conecta a la API pública de Wikipedia para obtener la Región y 
     los Habitantes de una comuna chilena de forma automatizada.
-    """
+    
     url_api = "https://es.wikipedia.org/w/api.php"
     params = {
         "action": "query",
@@ -95,6 +151,7 @@ def consultar_api_comuna(nombre_comuna):
     except Exception:
         # Si la API falla, se retorna que el dato no fue encontrado.
         return "No Encontrada", None
+"""
 
 # =====================================================================
 # PROCESADOR DE FAMOSOS
