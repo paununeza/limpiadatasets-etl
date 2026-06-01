@@ -21,12 +21,11 @@ export default function App() {
     setDatosResultado([]);
   };
 
-  const ejecutarETL = async (e, esManual = false) => {
+const ejecutarETL = async (e, esManual = false) => {
     if (e) e.preventDefault();
     
-    // Si no es manual y no hay archivo, no hace nada
+    // Validaciones de seguridad antes de disparar la petición
     if (!esManual && !archivo) return;
-    // Si es manual y viene vacío, no hace nada
     if (esManual && !comunaManual.trim()) return;
 
     setCargando(true);
@@ -35,32 +34,40 @@ export default function App() {
     formData.append('formato', formato);
     formData.append('ordenar', ordenar);
     
+    // Si es manual inyectamos el texto, si no, inyectamos el archivo binario
     if (esManual) {
-      formData.append('comuna_manual', comunaManual.trim()); // ENVÍA LA BÚSQUEDA INDIVIDUAL
+      formData.append('comuna_manual', comunaManual.trim());
     } else {
       formData.append('archivo', archivo);
     }
 
-    // Si estamos en comunas y el usuario subió un archivo de referencia, lo adjuntamos
     if (pestana === 'comunas' && archivoOficial && !esManual) {
       formData.append('archivo_oficial', archivoOficial);
     }
 
-    // Mapeo dinámico de endpoints del backend en Django
+    // URL de producción oficial en Render
     let url = 'https://limpiadatasets-etl.onrender.com/api/etl/comunas/';
     if (pestana === 'famosos') url = 'https://limpiadatasets-etl.onrender.com/api/etl/famosos/';
     if (pestana === 'lugares') url = 'https://limpiadatasets-etl.onrender.com/api/etl/lugares/';
 
     try {
+      // Usamos AXIOS
       const respuesta = await axios.post(url, formData, {
         headers: { 'Content-Type': 'multipart/form-data' }
       });
+      
       setLogs(respuesta.data.logs);
       setDatosResultado(respuesta.data.data);
-      if (esManual) setComunaManual(''); // Limpia el input si todo salió bien
+      
+      if (esManual) setComunaManual(''); // Limpia el cuadro de texto si fue exitoso
     } catch (error) {
       console.error(error);
-      alert("Error al conectar con el servidor Django.");
+      // Imprime el error real en una alerta para saber qué responde Django
+      if (error.response) {
+        alert(`Error del Servidor: ${error.response.status} - ${JSON.stringify(error.response.data)}`);
+      } else {
+        alert("Error al conectar con el servidor Django. Revisa la consola para más detalles.");
+      }
     } finally {
       setCargando(false);
     }
