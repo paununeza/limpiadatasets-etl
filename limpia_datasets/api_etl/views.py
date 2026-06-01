@@ -3,6 +3,7 @@ import time
 import difflib
 import unicodedata
 from datetime import datetime
+from dateutil import parser
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework.parsers import MultiPartParser
@@ -19,7 +20,6 @@ def decodificar_linea(linea_bytes):
     try:
         return linea_bytes.decode('utf-8').strip()
     except UnicodeDecodeError:
-        # Si falla UTF-8, decodifica usando Latin-1 (soporta tildes tradicionales de Windows)
         return linea_bytes.decode('latin-1').strip()
 
 def quitar_tildes(texto):
@@ -48,7 +48,7 @@ def buscar_fuzz(texto_normalizado, lista_oficial, cutoff=0.75):
 
 
 # =====================================================================
-# VISTA PARTE 2: PROCESADOR DE FAMOSOS (ORDENAMIENTO)
+# PROCESADOR DE FAMOSOS (CORREGIDO HOMÓNIMOS Y FECHAS)
 # =====================================================================
 
 class ProcesarFamososView(APIView):
@@ -57,9 +57,8 @@ class ProcesarFamososView(APIView):
     def post(self, request):
         archivo = request.FILES.get('archivo')
         diccionario_id = request.data.get('diccionario_id')
-        ordenar_param = request.data.get('ordenar')  # Capturamos el flag enviado por React
+        ordenar_param = request.data.get('ordenar')
         
-        # En las APIs los booleanos en FormData viajan como strings "true" o "false"
         debe_ordenar = ordenar_param == 'true' or ordenar_param is True
 
         if not archivo:
@@ -71,7 +70,6 @@ class ProcesarFamososView(APIView):
 
         logs = []
         famosos_creados = []
-        nombres_unicos = set()
         
         anho_actual = 2026 
         mes_actual = datetime.now().month
@@ -80,11 +78,9 @@ class ProcesarFamososView(APIView):
         logs.append(f"=== ETL FAMOSOS INICIADO - TIMESTAMP UNIX: {int(time.time())} ===")
 
         for idx, linea in enumerate(archivo, start=1):
-            # Uso de decodificación segura
             linea_str = decodificar_linea(linea)
             
             if not linea_str:
-                logs.append(f"[{datetime.now().strftime('%X')}][LÍNEA {idx}] Línea vacía eliminada.")
                 continue
 
             linea_limpia = re.sub(r'^\d+\.\s*', '', linea_str).strip()
@@ -97,17 +93,10 @@ class ProcesarFamososView(APIView):
             nombre_raw = partes_famoso[0].strip()
             fecha_raw = partes_famoso[1].strip()
             
-            nombre_norm = limpiar_texto_basico(nombre_raw)
-            nombre_final, corregido_fuzz = buscar_fuzz(nombre_norm, lista_oficial)
+            nombre_final, corregido_fuzz = buscar_fuzz(limpiar_texto_basico(nombre_raw), lista_oficial)
             
             if corregido_fuzz:
                 logs.append(f"[{datetime.now().strftime('%X')}][LÍNEA {idx}] FUZZ CORRECCIÓN: '{nombre_raw}' -> '{nombre_final}'")
-
-            if nombre_final in nombres_unicos:
-                logs.append(f"[{datetime.now().strftime('%X')}][LÍNEA {idx}] DUPLICADO ELIMINADO: '{nombre_final}' ya fue procesado.")
-                continue
-            
-            nombres_unicos.add(nombre_final)
 
             es_ac = any(x in fecha_raw.lower() for x in ["a.c.", "b.c."])
             fecha_chile = ""
@@ -122,43 +111,34 @@ class ProcesarFamososView(APIView):
                     es_cumpleanos = (mes_actual == 1 and dia_actual == 1)
                 except Exception:
                     logs.append(f"[{datetime.now().strftime('%X')}][LÍNEA {idx}] Error en año a.C. Omitido.")
-                    nombres_unicos.remove(nombre_final)
                     continue
             else:
-                # parseo estricto estándar (si viene con formato normal DD-MM-YYYY o YYYY-MM-DD)
-                fecha_normalizada = fecha_raw.replace('/', '-')
+                # Usa parser inteligente forzando Día primero
                 try:
-                    dt_nacimiento = datetime.strptime(fecha_normalizada, "%Y-%m-%d")
+                    # Sustituir guiones por diagonales para homogeneizar o viceversa
+                    fecha_normalizada = fecha_raw.replace('/', '-')
+                    
+                    # Forzar dayfirst=True
+                    dt_nacimiento = parser.parse(fecha_normalizada, dayfirst=True)
+                    
                     fecha_chile = dt_nacimiento.strftime("%d-%m-%Y")
                     edad = anho_actual - dt_nacimiento.year - ((mes_actual, dia_actual) < (dt_nacimiento.month, dt_nacimiento.day))
                     es_cumpleanos = (mes_actual == dt_nacimiento.month and dia_actual == dt_nacimiento.day)
-                except ValueError:
-                    try:
-                        dt_nacimiento = datetime.strptime(fecha_normalizada, "%d-%m-%Y")
-                        fecha_chile = dt_nacimiento.strftime("%d-%m-%Y")
-                        edad = anho_actual - dt_nacimiento.year - ((mes_actual, dia_actual) < (dt_nacimiento.month, dt_nacimiento.day))
-                        es_cumpleanos = (mes_actual == dt_nacimiento.month and dia_actual == dt_nacimiento.day)
-                    except ValueError:
-                        
-                        # REFUERZO: Si falla el parseo estricto, buscamos un año suelto (ej: "alrededor de 1028")
-                        match_anho = re.search(r'\b\d{3,4}\b', fecha_raw) # Busca un número de 3 o 4 dígitos
-                        if match_anho:
-                            anho_extraido = int(match_anho.group())
-                            fecha_chile = f"01-01-{anho_extraido:04d}" # Formato por defecto para años incompletos
-                            edad = anho_actual - anho_extraido
-                            es_cumpleanos = (mes_actual == 1 and dia_actual == 1)
-                            
-                            logs.append(f"[{datetime.now().strftime('%X')}][LÍNEA {idx}] PARSEO REPARADO: Se extrajo el año '{anho_extraido}' del texto sucio '{fecha_raw}'.")
-                        else:
-                            # Si no hay ningún año numérico, se descarta
-                            logs.append(f"[{datetime.now().strftime('%X')}][LÍNEA {idx}] Imposible parsear fecha '{fecha_raw}'. Omitido.")
-                            nombres_unicos.remove(nombre_final)
-                            continue
+                    
+                except (ValueError, TypeError):
+                    # Si no es una fecha estructurada completa, extrae el año libre
+                    match_anho = re.search(r'\b\d{3,4}\b', fecha_raw)
+                    if match_anho:
+                        anho_extraido = int(match_anho.group())
+                        fecha_chile = f"01-01-{anho_extraido:04d}"
+                        edad = anho_actual - anho_extraido
+                        es_cumpleanos = (mes_actual == 1 and dia_actual == 1)
+                        logs.append(f"[{datetime.now().strftime('%X')}][LÍNEA {idx}] PARSEO REPARADO: Se infirió el año '{anho_extraido}' de '{fecha_raw}'.")
+                    else:
+                        logs.append(f"[{datetime.now().strftime('%X')}][LÍNEA {idx}] Imposible parsear fecha '{fecha_raw}'. Omitido.")
+                        continue
 
-                fecha_chile = dt_nacimiento.strftime("%d-%m-%Y")
-                edad = anho_actual - dt_nacimiento.year - ((mes_actual, dia_actual) < (dt_nacimiento.month, dt_nacimiento.day))
-                es_cumpleanos = (mes_actual == dt_nacimiento.month and dia_actual == dt_nacimiento.day)
-
+            # Guarda directo en la BD permitiendo duplicados legítimos de nombres
             famoso_obj = Famoso.objects.create(
                 nombre=nombre_final,
                 fecha_nacimiento_original=fecha_raw,
@@ -167,11 +147,7 @@ class ProcesarFamososView(APIView):
                 es_cumpleanos=es_cumpleanos
             )
             famosos_creados.append(famoso_obj)
-            
-            if famoso_obj.fecha_nacimiento_original != famoso_obj.fecha_nacimiento_chile:
-                logs.append(f"[{datetime.now().strftime('%X')}][LÍNEA {idx}] NORMALIZADO: '{famoso_obj.nombre}' - Fecha ajustada a formato (DD-MM-YYYY).")
 
-        # Aplicar ordenamiento por nombre si viene el flag activo
         if debe_ordenar:
             famosos_creados.sort(key=lambda x: x.nombre)
 
@@ -180,7 +156,7 @@ class ProcesarFamososView(APIView):
 
 
 # =====================================================================
-# VISTA PARTE 3: PROCESADOR DE LUGARES (UNICODEDECODE)
+# PROCESADOR DE LUGARES
 # =====================================================================
 
 class ProcesarLugaresView(APIView):
@@ -201,7 +177,6 @@ class ProcesarLugaresView(APIView):
         logs.append(f"=== ETL LUGARES INICIADO - TIMESTAMP UNIX: {int(time.time())} ===")
 
         for idx, linea in enumerate(archivo, start=1):
-            # Uso de decodificación segura para mitigar tildes en Latin-1 / ISO-8859-1 
             linea_str = decodificar_linea(linea)
             
             if not linea_str or "Nombre del lugar;" in linea_str: 
@@ -209,7 +184,6 @@ class ProcesarLugaresView(APIView):
 
             partes = linea_str.split(';')
             if len(partes) < 3:
-                logs.append(f"[{datetime.now().strftime('%X')}][LÍNEA {idx}] Faltan columnas en el registro. Omitido.")
                 continue
 
             nombre_lugar_raw = partes[0]
@@ -219,7 +193,6 @@ class ProcesarLugaresView(APIView):
             nombre_lugar = limpiar_texto_basico(nombre_lugar_raw)
 
             if nombre_lugar in lugares_unicos:
-                logs.append(f"[{datetime.now().strftime('%X')}][LÍNEA {idx}] ELIMINADO DUPLICADO: El lugar '{nombre_lugar}' ya existe.")
                 continue
             
             lugares_unicos.add(nombre_lugar)
@@ -231,14 +204,15 @@ class ProcesarLugaresView(APIView):
                     lat = float(lat_str.strip())
                     lon = float(lon_str.strip()) if lon_str.strip() else None
             except ValueError:
-                logs.append(f"[{datetime.now().strftime('%X')}][LÍNEA {idx}] Error al procesar coordenadas en '{nombre_lugar}'.")
+                pass
 
+            # Segmentamos los bloques de la dirección por comas
             componentes_dir = [c.strip() for c in direccion_completa_raw.split(',')]
             
-            nombre_calle = None
-            numero_calle = None
-            ciudad_estado_provincia = None
-            pais = None
+            nombre_calle = "s/n"
+            numero_calle = "s/n"
+            ciudad_estado_provincia = "Desconocida"
+            pais = "Desconocido"
 
             if len(componentes_dir) >= 1:
                 pais = limpiar_texto_basico(componentes_dir[-1])
@@ -246,16 +220,23 @@ class ProcesarLugaresView(APIView):
                 ciudad_estado_provincia = limpiar_texto_basico(componentes_dir[-2]) 
             
             if len(componentes_dir) >= 3:
+                # La primera sección usualmente contiene la Calle y el Número
                 calle_numero_raw = componentes_dir[0]
-                match_numero = re.match(r'^(\d+[A-Za-z]?)?\s+(.*)', calle_numero_raw)
                 
-                if match_numero:
-                    numero_calle = match_numero.group(1) if match_numero.group(1) else "S/N"
-                    nombre_calle = limpiar_texto_basico(match_numero.group(2))
+                # Expresión regular robusta que busca números aislados al inicio o final
+                numeros_encontrados = re.findall(r'\b\d+[A-Za-z]?\b', calle_numero_raw)
+                
+                if numeros_encontrados:
+                    # El último número encontrado suele ser la altura/número municipal de la calle
+                    numero_calle = numeros_encontrados[-1]
+                    # Removemos el número del texto para quedarnos puramente con la calle
+                    calle_limpia = calle_numero_raw.replace(numero_calle, "").strip()
+                    nombre_calle = limpiar_texto_basico(calle_limpia)
                 else:
                     nombre_calle = limpiar_texto_basico(calle_numero_raw)
-                    numero_calle = "S/N"
+                    numero_calle = "s/n"
                 
+                # Unificar elementos intermedios si el dataset es muy largo
                 if len(componentes_dir) > 3:
                     intermedios = " ".join([limpiar_texto_basico(c) for c in componentes_dir[1:-2]])
                     ciudad_estado_provincia = f"{intermedios} {ciudad_estado_provincia}".strip()
@@ -271,9 +252,7 @@ class ProcesarLugaresView(APIView):
             )
 
             lugares_procesados.append(lugar_obj)
-            logs.append(f"[{datetime.now().strftime('%X')}][LÍNEA {idx}] GUARDADO RELACIONAL: '{nombre_lugar}' en tablas Lugares, Georeferencias y Direcciones.")
 
-        # Ordenamiento para la sección de lugares
         if debe_ordenar:
             lugares_procesados.sort(key=lambda x: x.nombre_lugar)
 
@@ -281,7 +260,8 @@ class ProcesarLugaresView(APIView):
         return Response({"logs": logs, "data": serializer.data})
     
     
-    # VISTA PARTE 1: PROCESADOR DE COMUNAS ULTRA-OPTIMIZADO (CACHE EN RAM)
+# =====================================================================
+# PROCESADOR DE COMUNAS
 # =====================================================================
 class ProcesarComunasView(APIView):
     parser_classes = [MultiPartParser]
@@ -304,17 +284,15 @@ class ProcesarComunasView(APIView):
         t_inicio = time.time()
         logs = []
         comunas_finales_proceso = []
-        comunas_unicas_procesadas = set()
+        comunas_unicas_processed = set()
 
         logs.append(f"=== ETL COMUNAS OPTIMIZADO INICIADO (Sensibilidad: {int(sensibilidad*100)}%) ===")
 
-        # 1. Obtener o crear el Diccionario Padre
         diccionario_obj, _ = DiccionarioReferencia.objects.get_or_create(
             nombre="Comunas de Chile",
             defaults={"descripcion": "Listado maestro de comunas normalizadas."}
         )
 
-        # 2. Inserción masiva de oficiales (si viene el archivo)
         if archivo_oficial:
             TerminoValido.objects.filter(diccionario=diccionario_obj).delete()
             nuevos_terminos_oficiales = []
@@ -331,15 +309,12 @@ class ProcesarComunasView(APIView):
                         )
             TerminoValido.objects.bulk_create(nuevos_terminos_oficiales, batch_size=1000)
 
-        # 3. TURBO OPTIMIZACIÓN: Crear un mapa en caché para evitar re-calcular Fuzzy repetido
         lista_oficial_bd = list(TerminoValido.objects.filter(diccionario=diccionario_obj).values_list('valor_oficial', flat=True))
         set_oficiales_existentes = set(lista_oficial_bd)
         
-        # Este diccionario recordará los resultados ya calculados (O(1) de velocidad)
         cache_fuzz = {}
         nuevos_registros_bd = []
 
-        # 4. PROCESAR EL DATASET MASIVO
         for idx, linea in enumerate(archivo_sucio, start=1):
             linea_str = decodificar_linea(linea)
             if not linea_str or "comuna" in linea_str.lower():
@@ -347,18 +322,16 @@ class ProcesarComunasView(APIView):
 
             comuna_limpia_inicial = limpiar_texto_basico(linea_str)
 
-            # Si ya calculamos esta palabra antes, la sacamos de la RAM instantáneamente sin usar CPU
             if comuna_limpia_inicial in cache_fuzz:
                 comuna_final, corregido_fuzz = cache_fuzz[comuna_limpia_inicial]
             else:
-                # Solo calcula la distancia matemática si es una palabra nueva
                 comuna_final, corregido_fuzz = buscar_fuzz(comuna_limpia_inicial, lista_oficial_bd, cutoff=sensibilidad)
                 cache_fuzz[comuna_limpia_inicial] = (comuna_final, corregido_fuzz)
 
-            if comuna_final in comunas_unicas_procesadas:
+            if comuna_final in comunas_unicas_processed:
                 continue
 
-            comunas_unicas_procesadas.add(comuna_final)
+            comunas_unicas_processed.add(comuna_final)
             comunas_finales_proceso.append({"id": idx, "valor_oficial": comuna_final})
 
             if comuna_final not in set_oficiales_existentes:
@@ -367,16 +340,14 @@ class ProcesarComunasView(APIView):
                     TerminoValido(diccionario=diccionario_obj, valor_oficial=comuna_final)
                 )
 
-        # 5. Guardado en bloques optimizados
         if nuevos_registros_bd:
             TerminoValido.objects.bulk_create(nuevos_registros_bd, batch_size=1000)
             logs.append(f"[{datetime.now().strftime('%X')}] Base de datos: Se persistieron {len(nuevos_registros_bd)} términos nuevos en Neon Postgres.")
         else:
             logs.append(f"[{datetime.now().strftime('%X')}] Base de datos: No se detectaron términos nuevos para guardar.")
 
-        # MÉTRICAS
         total_lineas_leidas = idx
-        total_unicas = len(comunas_unicas_procesadas)
+        total_unicas = len(comunas_unicas_processed)
         total_duplicados = total_lineas_leidas - total_unicas
 
         logs.append(f"[{datetime.now().strftime('%X')}] Análisis: Se procesaron {total_lineas_leidas} filas totales.")
