@@ -15,12 +15,14 @@ class DiccionarioReferencia(models.Model):
 class TerminoValido(models.Model):
     diccionario = models.ForeignKey(DiccionarioReferencia, on_delete=models.CASCADE, related_name='terminos')
     valor_oficial = models.CharField(max_length=255)
+    region = models.CharField(max_length=255, null=True, blank=True)
+    habitantes = models.IntegerField(null=True, blank=True)
 
     class Meta:
         unique_together = ('diccionario', 'valor_oficial')
 
     def __str__(self):
-        return f"{self.valor_oficial} ({self.diccionario.nombre})"
+        return f"{self.valor_oficial} - {self.region or 'Sin Región'} ({self.diccionario.nombre})"
 
 
 # =====================================================================

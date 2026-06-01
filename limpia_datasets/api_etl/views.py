@@ -2,6 +2,7 @@ import re
 import time
 import difflib
 import unicodedata
+import requests
 from datetime import datetime
 from dateutil import parser
 from rest_framework.views import APIView
@@ -46,9 +47,57 @@ def buscar_fuzz(texto_normalizado, lista_oficial, cutoff=0.75):
         return limpiar_texto_basico(validos_dict[coincidencias[0]]), True
     return texto_normalizado, False
 
+# =====================================================================
+# Consultas API Wikipedia
+# =====================================================================
+
+def consultar_api_comuna(nombre_comuna):
+    """
+    Se conecta a la API pública de Wikipedia para obtener la Región y 
+    los Habitantes de una comuna chilena de forma automatizada.
+    """
+    url_api = "https://es.wikipedia.org/w/api.php"
+    params = {
+        "action": "query",
+        "format": "json",
+        "prop": "extracts",
+        "exintro": True,
+        "explaintext": True,
+        "titles": f"Comuna de {nombre_comuna}",
+        "redirects": 1
+    }
+    
+    region = "Desconocida"
+    habitantes = 0
+    
+    try:
+        respuesta = requests.get(url_api, params=params, timeout=5)
+        datos = respuesta.json()
+        paginas = datos.get("query", {}).get("pages", {})
+        
+        for pid, pinfo in paginas.items():
+            if pid != "-1":  # Si la página existe en Wikipedia
+                texto_intro = pinfo.get("extract", "")
+                
+                # 1. Extracción de la Región usando expresiones regulares
+                match_region = re.search(r'región d[e|el|as]\s+([A-ZÁÉÍÓÚa-záéíóú\s]+?)(?=[,\.]|$)', texto_intro, re.IGNORECASE)
+                if match_region:
+                    region = match_region.group(1).strip().title()
+                
+                # 2. Extracción de habitantes (Busca números seguidos de 'habitantes')
+                match_hab = re.search(r'(\d+[\.\s]?\d*[\.\s]?\d*)\s+habitantes', texto_intro, re.IGNORECASE)
+                if match_hab:
+                    # Limpiamos puntos o espacios del número (150.342 -> 150342)
+                    num_limpio = re.sub(r'[\.\s]', '', match_hab.group(1))
+                    habitantes = int(num_limpio)
+                    
+        return region, habitantes
+    except Exception:
+        # Si la API falla, se retorna que el dato no fue encontrado.
+        return "No Encontrada", None
 
 # =====================================================================
-# PROCESADOR DE FAMOSOS (CORREGIDO HOMÓNIMOS Y FECHAS)
+# PROCESADOR DE FAMOSOS
 # =====================================================================
 
 class ProcesarFamososView(APIView):
@@ -261,7 +310,7 @@ class ProcesarLugaresView(APIView):
     
     
 # =====================================================================
-# PROCESADOR DE COMUNAS
+# PROCESADOR DE COMUNAS (INTEGRACIÓN API + BÚSQUEDA MANUAL)
 # =====================================================================
 class ProcesarComunasView(APIView):
     parser_classes = [MultiPartParser]
@@ -269,6 +318,7 @@ class ProcesarComunasView(APIView):
     def post(self, request):
         archivo_sucio = request.FILES.get('archivo')
         archivo_oficial = request.FILES.get('archivo_oficial')
+        comuna_manual = request.data.get('comuna_manual') # <-- CAPTURAMOS BÚSQUEDA MANUAL
         ordenar_param = request.data.get('ordenar')
         sensibilidad_param = request.data.get('sensibilidad', 0.75)
         
@@ -278,13 +328,15 @@ class ProcesarComunasView(APIView):
         except ValueError:
             sensibilidad = 0.75
 
-        if not archivo_sucio:
-            return Response({"error": "No se ha subido ningún archivo para procesar"}, status=400)
+        # Validación flexible: Debe venir o un archivo o una búsqueda manual
+        if not archivo_sucio and not comuna_manual and not archivo_oficial:
+            return Response({"error": "No se ha proporcionado un archivo ni una comuna manual"}, status=400)
 
         t_inicio = time.time()
         logs = []
         comunas_finales_proceso = []
         comunas_unicas_processed = set()
+        registros_no_encontrados_api = 0 # <-- MÉTRICA EXIGIDA POR PAUTA
 
         logs.append(f"=== ETL COMUNAS OPTIMIZADO INICIADO (Sensibilidad: {int(sensibilidad*100)}%) ===")
 
@@ -293,6 +345,7 @@ class ProcesarComunasView(APIView):
             defaults={"descripcion": "Listado maestro de comunas normalizadas."}
         )
 
+        # Cargar diccionario oficial si viene el archivo
         if archivo_oficial:
             TerminoValido.objects.filter(diccionario=diccionario_obj).delete()
             nuevos_terminos_oficiales = []
@@ -304,23 +357,40 @@ class ProcesarComunasView(APIView):
                     comuna_of_norm = limpiar_texto_basico(linea_of_str)
                     if comuna_of_norm not in oficiales_unicos:
                         oficiales_unicos.add(comuna_of_norm)
+                        # Buscamos datos complementarios en la API para el diccionario oficial
+                        reg, hab = consultar_api_comuna(comuna_of_norm)
                         nuevos_terminos_oficiales.append(
-                            TerminoValido(diccionario=diccionario_obj, valor_oficial=comuna_of_norm)
+                            TerminoValido(
+                                diccionario=diccionario_obj, 
+                                valor_oficial=comuna_of_norm,
+                                region=reg,
+                                habitantes=hab
+                            )
                         )
             TerminoValido.objects.bulk_create(nuevos_terminos_oficiales, batch_size=1000)
 
+        # Cargar datos existentes de la BD a la RAM
         lista_oficial_bd = list(TerminoValido.objects.filter(diccionario=diccionario_obj).values_list('valor_oficial', flat=True))
         set_oficiales_existentes = set(lista_oficial_bd)
-        
         cache_fuzz = {}
         nuevos_registros_bd = []
 
-        for idx, linea in enumerate(archivo_sucio, start=1):
-            linea_str = decodificar_linea(linea)
-            if not linea_str or "comuna" in linea_str.lower():
-                continue
+        # DETERMINAR ENTRADA: ¿Es un archivo masivo o una sola comuna manual?
+        lineas_a_procesar = []
+        if comuna_manual:
+            lineas_a_procesar = [comuna_manual]
+            total_lineas_leidas = 1
+        else:
+            # Es un archivo
+            for idx, linea in enumerate(archivo_sucio, start=1):
+                linea_str = decodificar_linea(linea)
+                if linea_str and not "comuna" in linea_str.lower():
+                    lineas_a_procesar.append(linea_str)
+            total_lineas_leidas = len(lineas_a_procesar)
 
-            comuna_limpia_inicial = limpiar_texto_basico(linea_str)
+        # PROCESAMIENTO DEL PIPELINE
+        for idx, linea_texto in enumerate(lineas_a_procesar, start=1):
+            comuna_limpia_inicial = limpiar_texto_basico(linea_texto)
 
             if comuna_limpia_inicial in cache_fuzz:
                 comuna_final, corregido_fuzz = cache_fuzz[comuna_limpia_inicial]
@@ -332,27 +402,43 @@ class ProcesarComunasView(APIView):
                 continue
 
             comunas_unicas_processed.add(comuna_final)
-            comunas_finales_proceso.append({"id": idx, "valor_oficial": comuna_final})
 
+            # Consultar o recuperar datos consolidados de la API externa
+            reg, hab = consultar_api_comuna(comuna_final)
+            if reg == "Desconocida":
+                registros_no_encontrados_api += 1
+
+            comunas_finales_proceso.append({
+                "id": idx, 
+                "valor_oficial": comuna_final,
+                "region": reg,
+                "habitantes": hab
+            })
+
+            # Evitar registros duplicados en la estructura final (Base de Datos)
             if comuna_final not in set_oficiales_existentes:
                 set_oficiales_existentes.add(comuna_final)
                 nuevos_registros_bd.append(
-                    TerminoValido(diccionario=diccionario_obj, valor_oficial=comuna_final)
+                    TerminoValido(
+                        diccionario=diccionario_obj, 
+                        valor_oficial=comuna_final,
+                        region=reg,
+                        habitantes=hab
+                    )
                 )
 
         if nuevos_registros_bd:
             TerminoValido.objects.bulk_create(nuevos_registros_bd, batch_size=1000)
-            logs.append(f"[{datetime.now().strftime('%X')}] Base de datos: Se persistieron {len(nuevos_registros_bd)} términos nuevos en Neon Postgres.")
-        else:
-            logs.append(f"[{datetime.now().strftime('%X')}] Base de datos: No se detectaron términos nuevos para guardar.")
 
-        total_lineas_leidas = idx
+        # AUDITORÍA DE LOGS EXIGIDA POR LA PAUTA
         total_unicas = len(comunas_unicas_processed)
         total_duplicados = total_lineas_leidas - total_unicas
 
-        logs.append(f"[{datetime.now().strftime('%X')}] Análisis: Se procesaron {total_lineas_leidas} filas totales.")
-        logs.append(f"[{datetime.now().strftime('%X')}] Filtro Duplicados: Se redujo el set a {total_unicas} comunas únicas (Omitidos: {total_duplicados} registros repetidos).")
-        logs.append(f"[{datetime.now().strftime('%X')}] Caché RAM: {len(cache_fuzz)} combinaciones Fuzzy calculadas y almacenadas en Hash Map.")
+        logs.append(f"[{datetime.now().strftime('%X')}] Auditoría: Se leyeron {total_lineas_leidas} registros.")
+        logs.append(f"[{datetime.now().strftime('%X')}] Auditoría: Se procesaron {total_unicas} comunas únicas.")
+        logs.append(f"[{datetime.now().strftime('%X')}] Auditoría: Se eliminaron {total_duplicados} registros duplicados.")
+        logs.append(f"[{datetime.now().strftime('%X')}] Auditoría: Se consolidaron {len(comunas_finales_proceso)} registros correctamente.")
+        logs.append(f"[{datetime.now().strftime('%X')}] Auditoría: {registros_no_encontrados_api} registros no encontrados en la fuente oficial de la API.")
 
         if debe_ordenar:
             comunas_finales_proceso.sort(key=lambda x: x["valor_oficial"])
