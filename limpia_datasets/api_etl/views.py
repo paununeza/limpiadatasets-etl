@@ -64,6 +64,10 @@ def consultar_api_comuna(nombre_comuna):
         nombre_comuna,
         f"{nombre_comuna} (Chile)"
     ]
+
+    cabeceras = {
+        "User-Agent": "AppLimpiaDatasetsETL/1.6 (hernan.saez03@inacapmail.cl; Estudiante INACAP)"
+    }
     
     region = "No Encontrada"
     habitantes = None
@@ -80,7 +84,7 @@ def consultar_api_comuna(nombre_comuna):
         }
         
         try:
-            respuesta = requests.get(url_api, params=params, timeout=5)
+            respuesta = requests.get(url_api, params=params, headers=cabeceras, timeout=5)
             datos = respuesta.json()
             paginas = datos.get("query", {}).get("pages", {})
             
@@ -449,21 +453,25 @@ class ProcesarComunasView(APIView):
         for idx, linea_texto in enumerate(lineas_a_procesar, start=1):
             comuna_limpia_inicial = limpiar_texto_basico(linea_texto)
 
+            # 🚀 SI YA LO CALCULAMOS ANTES, EXTRAER TODO DE LA RAM INSTANTÁNEAMENTE (0 SEGUNDOS)
             if comuna_limpia_inicial in cache_fuzz:
-                comuna_final, corregido_fuzz = cache_fuzz[comuna_limpia_inicial]
+                comuna_final, reg, hab = cache_fuzz[comuna_limpia_inicial]
             else:
+                # 1. Calcular la corrección ortográfica difusa
                 comuna_final, corregido_fuzz = buscar_fuzz(comuna_limpia_inicial, lista_oficial_bd, cutoff=sensibilidad)
-                cache_fuzz[comuna_limpia_inicial] = (comuna_final, corregido_fuzz)
+                
+                # 2. Ir a internet SOLO si es una comuna nueva en esta ejecución
+                reg, hab = consultar_api_comuna(comuna_final)
+                if reg == "No Encontrada":
+                    registros_no_encontrados_api += 1
+                
+                # 3. Guardar en memoria para las próximas repeticiones
+                cache_fuzz[comuna_limpia_inicial] = (comuna_final, reg, hab)
 
             if comuna_final in comunas_unicas_processed:
                 continue
 
             comunas_unicas_processed.add(comuna_final)
-
-            # Consultar o recuperar datos consolidados de la API externa
-            reg, hab = consultar_api_comuna(comuna_final)
-            if reg == "Desconocida":
-                registros_no_encontrados_api += 1
 
             comunas_finales_proceso.append({
                 "id": idx, 
@@ -472,7 +480,6 @@ class ProcesarComunasView(APIView):
                 "habitantes": hab
             })
 
-            # Evitar registros duplicados en la estructura final (Base de Datos)
             if comuna_final not in set_oficiales_existentes:
                 set_oficiales_existentes.add(comuna_final)
                 nuevos_registros_bd.append(
@@ -487,7 +494,7 @@ class ProcesarComunasView(APIView):
         if nuevos_registros_bd:
             TerminoValido.objects.bulk_create(nuevos_registros_bd, batch_size=1000)
 
-        # AUDITORÍA DE LOGS EXIGIDA POR LA PAUTA
+        # AUDITORÍA DE LOGS
         total_unicas = len(comunas_unicas_processed)
         total_duplicados = total_lineas_leidas - total_unicas
 
