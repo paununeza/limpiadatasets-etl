@@ -5,6 +5,7 @@ export default function App() {
   const [pestana, setPestana] = useState('comunas'); // 'comunas', 'famosos' o 'lugares'
   const [archivo, setArchivo] = useState(null);
   const [archivoOficial, setArchivoOficial] = useState(null); // Listado oficial
+  const [comunaManual, setComunaManual] = useState(''); // Captura búsqueda manual
   const [cargando, setCargando] = useState(false);
   const [formato, setFormato] = useState('.txt');
   const [ordenar, setOrdenar] = useState(true);
@@ -15,37 +16,40 @@ export default function App() {
 
   const handleCambioArchivo = (e) => {
     setArchivo(e.target.files[0]);
+    setComunaManual(''); // Si sube archivo, limpiamos el manual
     setLogs([]);
     setDatosResultado([]);
   };
 
-  const ejecutarETL = async (e) => {
-    e.preventDefault();
-    if (!archivo) return;
+  const ejecutarETL = async (e, esManual = false) => {
+    if (e) e.preventDefault();
+    
+    // Si no es manual y no hay archivo, no hace nada
+    if (!esManual && !archivo) return;
+    // Si es manual y viene vacío, no hace nada
+    if (esManual && !comunaManual.trim()) return;
 
     setCargando(true);
     const formData = new FormData();
-    formData.append('archivo', archivo);
     formData.append('sensibilidad', sensibilidad);
     formData.append('formato', formato);
     formData.append('ordenar', ordenar);
     
+    if (esManual) {
+      formData.append('comuna_manual', comunaManual.trim()); // ENVÍA LA BÚSQUEDA INDIVIDUAL
+    } else {
+      formData.append('archivo', archivo);
+    }
+
     // Si estamos en comunas y el usuario subió un archivo de referencia, lo adjuntamos
-    if (pestana === 'comunas' && archivoOficial) {
+    if (pestana === 'comunas' && archivoOficial && !esManual) {
       formData.append('archivo_oficial', archivoOficial);
     }
 
-    // Mapeo dinámico de endpoints del backend en Django (PRODUCCIÓN)
+    // Mapeo dinámico de endpoints del backend en Django
     let url = 'https://limpiadatasets-etl.onrender.com/api/etl/comunas/';
     if (pestana === 'famosos') url = 'https://limpiadatasets-etl.onrender.com/api/etl/famosos/';
     if (pestana === 'lugares') url = 'https://limpiadatasets-etl.onrender.com/api/etl/lugares/';
-
-/* 
-    // Mapeo dinámico de endpoints del backend en Django
-    let url = 'http://localhost:8000/api/etl/comunas/';
-    if (pestana === 'famosos') url = 'http://localhost:8000/api/etl/famosos/';
-    if (pestana === 'lugares') url = 'http://localhost:8000/api/etl/lugares/';
-*/
 
     try {
       const respuesta = await axios.post(url, formData, {
@@ -53,6 +57,7 @@ export default function App() {
       });
       setLogs(respuesta.data.logs);
       setDatosResultado(respuesta.data.data);
+      if (esManual) setComunaManual(''); // Limpia el input si todo salió bien
     } catch (error) {
       console.error(error);
       alert("Error al conectar con el servidor Django.");
@@ -67,7 +72,9 @@ export default function App() {
       contenido = JSON.stringify(datosResultado, null, 2);
     } else if (formato === '.csv') {
       if (pestana === 'comunas') {
-        contenido = "ID;Comuna Normalizada\n" + datosResultado.map(c => `${c.id};${c.valor_oficial}`).join("\n");
+        // AÑADIDO CON REGION Y HABITANTES
+        contenido = "ID;Comuna Normalizada;Region;Habitantes\n" + 
+          datosResultado.map(c => `${c.id};${c.valor_oficial};${c.region || 'No Encontrada'};${c.habitantes || 0}`).join("\n");
       } else if (pestana === 'famosos') {
         contenido = "Nombre;Fecha Nacimiento;Edad;Cumpleaños\n" + 
           datosResultado.map(f => `${f.nombre};${f.fecha_nacimiento_chile};${f.edad};${f.es_cumpleanos}`).join("\n");
@@ -77,7 +84,7 @@ export default function App() {
       }
     } else {
       if (pestana === 'comunas') {
-        contenido = datosResultado.map(c => c.valor_oficial).join("\n");
+        contenido = datosResultado.map(c => `${c.valor_oficial} - ${c.region || 'No Encontrada'}`).join("\n");
       } else if (pestana === 'famosos') {
         contenido = datosResultado.map(f => `${f.nombre} - ${f.fecha_nacimiento_chile}`).join("\n");
       } else {
@@ -85,13 +92,10 @@ export default function App() {
       }
     }
 
-    // --- nombre archivo ---
     let nombreDescarga = `resultado_${pestana}_normalizado${formato}`;
     
     if (archivo && archivo.name) {
-      // Tomar nombre del archivo y remover la extensión original
       const nombreSinExtension = archivo.name.substring(0, archivo.name.lastIndexOf('.')) || archivo.name;
-      // Construir el nuevo nombre con el formato seleccionado
       nombreDescarga = `${nombreSinExtension}_normalizado${formato}`;
     }
 
@@ -107,7 +111,7 @@ export default function App() {
     <div>
       <header>
         <h2>App LimpiaDatasets</h2>
-        <span style={{color: '#9ca3af', fontSize: '12px'}}>v1.5.0 (Producción Completa)</span>
+        <span style={{color: '#9ca3af', fontSize: '12px'}}>v1.6.0 (Métricas & API Enriquecida)</span>
       </header>
 
       <main>
@@ -116,15 +120,43 @@ export default function App() {
           <h3>Configuración</h3>
           
           <div className="tabs">
-            <button type="button" className={pestana === 'comunas' ? 'active' : ''} onClick={() => { setPestana('comunas'); setArchivo(null); setArchivoOficial(null); setLogs([]); setDatosResultado([]); }}>Comunas</button>
+            <button type="button" className={pestana === 'comunas' ? 'active' : ''} onClick={() => { setPestana('comunas'); setArchivo(null); setArchivoOficial(null); setComunaManual(''); setLogs([]); setDatosResultado([]); }}>Comunas</button>
             <button type="button" className={pestana === 'famosos' ? 'active' : ''} onClick={() => { setPestana('famosos'); setArchivo(null); setLogs([]); setDatosResultado([]); }}>Famosos</button>
             <button type="button" className={pestana === 'lugares' ? 'active' : ''} onClick={() => { setPestana('lugares'); setArchivo(null); setLogs([]); setDatosResultado([]); }}>Lugares</button>
           </div>
 
-          <form onSubmit={ejecutarETL}>
+          {/* MENÚ DE BÚSQUEDA MANUAL */}
+          {pestana === 'comunas' && (
+            <div style={{ padding: '12px', border: '1px dashed #4b5563', borderRadius: '6px', marginBottom: '15px', backgroundColor: '#1f2937' }}>
+              <label style={{ fontSize: '13px', fontWeight: 'bold', color: '#3b82f6', display: 'block', marginBottom: '6px' }}>
+                🔍 Ingesta e Historial Manual
+              </label>
+              <div style={{ display: 'flex', gap: '8px' }}>
+                <input 
+                  type="text" 
+                  value={comunaManual} 
+                  onChange={(e) => { setComunaManual(e.target.value); setArchivo(null); }}
+                  placeholder="Ej: florida, santiago centro, conce" 
+                  style={{ flex: 1, padding: '6px', borderRadius: '4px', border: '1px solid #4b5563', backgroundColor: '#111827', color: 'white' }}
+                />
+                <button 
+                  type="button" 
+                  onClick={(e) => ejecutarETL(e, true)} 
+                  disabled={cargando || !comunaManual.trim()}
+                  className="btn btn-primary"
+                  style={{ padding: '6px 12px', fontSize: '12px', margin: 0 }}
+                >
+                  Procesar
+                </button>
+              </div>
+            </div>
+          )}
+
+          <form onSubmit={(e) => ejecutarETL(e, false)}>
             <div className="form-group">
               <label>Seleccionar Dataset (.txt)</label>
-              <input type="file" accept=".txt" onChange={handleCambioArchivo} required />
+              {}
+              <input type="file" accept=".txt" onChange={handleCambioArchivo} required={!comunaManual} />
             </div>
 
             {/* Carga del listado oficial de comunas*/}
@@ -178,7 +210,7 @@ export default function App() {
             <h3>📋 Trazabilidad de Modificaciones (Logs)</h3>
             <div className="console">
               {logs.length === 0 ? (
-                <p style={{color: '#4b5563', fontStyle: 'italic'}}>Esperando archivo... Carga el dataset del módulo correspondiente para iniciar el pipeline.</p>
+                <p style={{color: '#4b5563', fontStyle: 'italic'}}>Esperando datos... Procesa un archivo o usa el cuadro manual.</p>
               ) : (
                 logs.map((log, i) => (
                   <p key={i} className={log.includes('ELIMINADO') ? 'log-error' : log.includes('FUZZ') ? 'log-fuzz' : ''}>
@@ -195,12 +227,14 @@ export default function App() {
               {datosResultado.length === 0 ? (
                 <p style={{padding: '20px', color: '#4b5563', fontStyle: 'italic', textAlign: 'center'}}>No hay datos cargados en memoria.</p>
               ) : pestana === 'comunas' ? (
-                /* Renderizado de Tabla Comunas */
+                /* RENDERIZADO TABLA COMUNAS ACTUALIZADO CON DATOS CONSOLIDADOS DE LA API */
                 <table>
                   <thead>
                     <tr>
                       <th>ID Registro</th>
-                      <th>Comuna Normalizada (Tabla TerminoValido)</th>
+                      <th>Comuna Normalizada</th>
+                      <th>Región (API Externa)</th>
+                      <th>Habitantes (Censo)</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -208,6 +242,8 @@ export default function App() {
                       <tr key={i}>
                         <td style={{color: '#6b7280', fontFamily: 'monospace'}}>{c.id}</td>
                         <td style={{color: 'white', fontWeight: 'bold'}}>{c.valor_oficial}</td>
+                        <td style={{color: '#10b981'}}>{c.region || 'No Encontrada'}</td>
+                        <td style={{color: '#3b82f6', fontFamily: 'monospace'}}>{c.habitantes ? c.habitantes.toLocaleString('cl-CL') : '0'}</td>
                       </tr>
                     ))}
                   </tbody>
