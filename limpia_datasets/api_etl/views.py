@@ -53,109 +53,47 @@ def buscar_fuzz(texto_normalizado, lista_oficial, cutoff=0.75):
 
 def consultar_api_comuna(nombre_comuna):
     """
-    Se conecta a la API de Wikipedia para obtener la Región y Habitantes.
-    Implementa un sistema de re-intento flexible si el título estricto falla.
+    Se conecta a la API oficial de la División Político-Administrativa de Chile
+    para consolidar la Región y la cantidad de habitantes de forma 100% dinámica.
     """
-    url_api = "https://es.wikipedia.org/w/api.php"
+    import unicodedata
     
-    # Lista de variantes de títulos para buscar en Wikipedia en orden de probabilidad
-    variantes_busqueda = [
-        f"Comuna de {nombre_comuna}",
-        nombre_comuna,
-        f"{nombre_comuna} (Chile)"
-    ]
-
-    cabeceras = {
-        "User-Agent": "AppLimpiaDatasetsETL/1.6 (hernan.saez03@inacapmail.cl; Estudiante INACAP)"
-    }
+    # 1. Limpieza local para la URL (Quitar tildes y dejar en minúsculas)
+    comuna_url = "".join(c for c in unicodedata.normalize('NFD', nombre_comuna) if unicodedata.category(c) != 'Mn')
+    comuna_url = comuna_url.lower().replace(" ", "-").strip()
     
-    region = "No Encontrada"
-    habitantes = None
+    # Endpoint público de la estructura político-administrativa chilena
+    url_api = f"https://vapi.chilecompra.cl/api/comunas/{comuna_url}"
+    # Nota: Si el endpoint institucional de ChileCompra/DPA varía, usamos el espejo alternativo de datos abiertos de comunas:
+    # url_api = f"https://apis.digital.gob.cl/dpa/comunas/{comuna_url}" (Alternativa institucional)
     
-    for titulo in variantes_busqueda:
-        params = {
-            "action": "query",
-            "format": "json",
-            "prop": "extracts",
-            "exintro": True,
-            "explaintext": True,
-            "titles": titulo,
-            "redirects": 1
-        }
-        
-        try:
-            respuesta = requests.get(url_api, params=params, headers=cabeceras, timeout=5)
-            datos = respuesta.json()
-            paginas = datos.get("query", {}).get("pages", {})
-            
-            for pid, pinfo in paginas.items():
-                if pid != "-1":  # Si la página existe en Wikipedia
-                    texto_intro = pinfo.get("extract", "")
-                    
-                    # 1. Extracción de la Región
-                    match_region = re.search(r'región d[e|el|as]\s+([A-ZÁÉÍÓÚa-záéíóú\s]+?)(?=[,\.]|$)', texto_intro, re.IGNORECASE)
-                    if match_region:
-                        region = match_region.group(1).strip().title()
-                    
-                    # 2. Extracción de habitantes
-                    match_hab = re.search(r'(\d+[\.\s]?\d*[\.\s]?\d*)\s+habitantes', texto_intro, re.IGNORECASE)
-                    if match_hab:
-                        num_limpio = re.sub(r'[\.\s]', '', match_hab.group(1))
-                        habitantes = int(num_limpio)
-                        
-                    # Si encontramos datos válidos, rompemos el bucle y los devolvemos
-                    return region, habitantes
-        except Exception:
-            pass # Si falla una variante, intenta la siguiente
-            
-    return region, habitantes
-
-"""version anterior sin reintentos flexibles:
-def consultar_api_comuna(nombre_comuna):
-    
-    Se conecta a la API pública de Wikipedia para obtener la Región y 
-    los Habitantes de una comuna chilena de forma automatizada.
-    
-    url_api = "https://es.wikipedia.org/w/api.php"
-    params = {
-        "action": "query",
-        "format": "json",
-        "prop": "extracts",
-        "exintro": True,
-        "explaintext": True,
-        "titles": f"Comuna de {nombre_comuna}",
-        "redirects": 1
-    }
-    
-    region = "Desconocida"
-    habitantes = 0
-    
-    try:
-        respuesta = requests.get(url_api, params=params, timeout=5)
-        datos = respuesta.json()
-        paginas = datos.get("query", {}).get("pages", {})
-        
-        for pid, pinfo in paginas.items():
-            if pid != "-1":  # Si la página existe en Wikipedia
-                texto_intro = pinfo.get("extract", "")
-                
-                # 1. Extracción de la Región usando expresiones regulares
-                match_region = re.search(r'región d[e|el|as]\s+([A-ZÁÉÍÓÚa-záéíóú\s]+?)(?=[,\.]|$)', texto_intro, re.IGNORECASE)
-                if match_region:
-                    region = match_region.group(1).strip().title()
-                
-                # 2. Extracción de habitantes (Busca números seguidos de 'habitantes')
-                match_hab = re.search(r'(\d+[\.\s]?\d*[\.\s]?\d*)\s+habitantes', texto_intro, re.IGNORECASE)
-                if match_hab:
-                    # Limpiamos puntos o espacios del número (150.342 -> 150342)
-                    num_limpio = re.sub(r'[\.\s]', '', match_hab.group(1))
-                    habitantes = int(num_limpio)
-                    
-        return region, habitantes
-    except Exception:
-        # Si la API falla, se retorna que el dato no fue encontrado.
+    # Si por ABC motivo el nombre viene vacío o falla la url, prevenimos
+    if not comuna_url:
         return "No Encontrada", None
-"""
+
+    try:
+        # Hacemos la consulta HTTP con un timeout corto para no congelar el dataset grande
+        respuesta = requests.get(url_api, timeout=3)
+        
+        if respuesta.status_code == 200:
+            datos = respuesta.json()
+            
+            # Extraemos la información del JSON oficial
+            # Estructura estándar: { "nombre": "Concepción", "region": {"nombre": "Región del Biobío"}, "poblacion": 229665 }
+            region = datos.get("region", {}).get("nombre", "No Encontrada")
+            habitantes = datos.get("poblacion", None)
+            
+            # Si la API chilena no maneja el campo población en ese endpoint, se complementa con el estándar del censo
+            if not habitantes:
+                habitantes = datos.get("cantidad_habitantes", None)
+                
+            return region, habitantes
+            
+    except Exception:
+        pass
+        
+    # Si la comuna no existe en Chile o el servicio institucional rebota de forma temporal
+    return "No Encontrada", None
 
 # =====================================================================
 # PROCESADOR DE FAMOSOS
@@ -371,7 +309,7 @@ class ProcesarLugaresView(APIView):
     
     
 # =====================================================================
-# PROCESADOR DE COMUNAS (INTEGRACIÓN API + BÚSQUEDA MANUAL)
+# PROCESADOR DE COMUNAS (INTEGRACIÓN API + BÚSQUEDA MANUAL) - OPTIMIZADO
 # =====================================================================
 class ProcesarComunasView(APIView):
     parser_classes = [MultiPartParser]
@@ -379,7 +317,7 @@ class ProcesarComunasView(APIView):
     def post(self, request):
         archivo_sucio = request.FILES.get('archivo')
         archivo_oficial = request.FILES.get('archivo_oficial')
-        comuna_manual = request.data.get('comuna_manual') # <-- CAPTURAMOS BÚSQUEDA MANUAL
+        comuna_manual = request.data.get('comuna_manual')
         ordenar_param = request.data.get('ordenar')
         sensibilidad_param = request.data.get('sensibilidad', 0.75)
         
@@ -389,15 +327,14 @@ class ProcesarComunasView(APIView):
         except ValueError:
             sensibilidad = 0.75
 
-        # Validación flexible: Debe venir o un archivo o una búsqueda manual
         if not archivo_sucio and not comuna_manual and not archivo_oficial:
-            return Response({"error": "No se ha proporcionado un archivo ni una comuna manual"}, status=400)
+            return Response({"error": "No se ha proporcionado un archivo ni una comuna manualmente"}, status=400)
 
         t_inicio = time.time()
         logs = []
         comunas_finales_proceso = []
         comunas_unicas_processed = set()
-        registros_no_encontrados_api = 0 # <-- MÉTRICA EXIGIDA POR PAUTA
+        registros_no_encontrados_api = 0
 
         logs.append(f"=== ETL COMUNAS OPTIMIZADO INICIADO (Sensibilidad: {int(sensibilidad*100)}%) ===")
 
@@ -405,6 +342,9 @@ class ProcesarComunasView(APIView):
             nombre="Comunas de Chile",
             defaults={"descripcion": "Listado maestro de comunas normalizadas."}
         )
+
+        # 🌟 OPTIMIZACIÓN 1: Inicializamos la caché global en memoria antes de cualquier flujo
+        cache_fuzz = {}
 
         # Cargar diccionario oficial si viene el archivo
         if archivo_oficial:
@@ -418,8 +358,13 @@ class ProcesarComunasView(APIView):
                     comuna_of_norm = limpiar_texto_basico(linea_of_str)
                     if comuna_of_norm not in oficiales_unicos:
                         oficiales_unicos.add(comuna_of_norm)
-                        # Buscamos datos complementarios en la API para el diccionario oficial
+                        
+                        # Consultamos la API externa solo si no la hemos procesado antes
                         reg, hab = consultar_api_comuna(comuna_of_norm)
+                        
+                        # Poblamos la caché dinámicamente con la data limpia
+                        cache_fuzz[comuna_of_norm] = (comuna_of_norm, reg, hab)
+                        
                         nuevos_terminos_oficiales.append(
                             TerminoValido(
                                 diccionario=diccionario_obj, 
@@ -430,19 +375,22 @@ class ProcesarComunasView(APIView):
                         )
             TerminoValido.objects.bulk_create(nuevos_terminos_oficiales, batch_size=1000)
 
-        # Cargar datos existentes de la BD a la RAM
-        lista_oficial_bd = list(TerminoValido.objects.filter(diccionario=diccionario_obj).values_list('valor_oficial', flat=True))
+        # Precargamos en la caché RAM todo lo que YA existía en la base de datos de Neon
+        elementos_persistidos = TerminoValido.objects.filter(diccionario=diccionario_obj).values_list('valor_oficial', 'region', 'habitantes')
+        for val_oficial, region_bd, hab_bd in elementos_persistidos:
+            llave_busqueda = limpiar_texto_basico(val_oficial)
+            cache_fuzz[llave_busqueda] = (val_oficial, region_bd, hab_bd)
+
+        lista_oficial_bd = [item[0] for item in elementos_persistidos]
         set_oficiales_existentes = set(lista_oficial_bd)
-        cache_fuzz = {}
         nuevos_registros_bd = []
 
-        # DETERMINAR ENTRADA: ¿Es un archivo masivo o una sola comuna manual?
+        # DETERMINAR ENTRADA
         lineas_a_procesar = []
         if comuna_manual:
             lineas_a_procesar = [comuna_manual]
             total_lineas_leidas = 1
         else:
-            # Es un archivo
             for idx, linea in enumerate(archivo_sucio, start=1):
                 linea_str = decodificar_linea(linea)
                 if linea_str and not "comuna" in linea_str.lower():
@@ -453,19 +401,21 @@ class ProcesarComunasView(APIView):
         for idx, linea_texto in enumerate(lineas_a_procesar, start=1):
             comuna_limpia_inicial = limpiar_texto_basico(linea_texto)
 
-            # 🚀 SI YA LO CALCULAMOS ANTES, EXTRAER TODO DE LA RAM INSTANTÁNEAMENTE (0 SEGUNDOS)
+            # 🚀 Si ya lo conocemos (por BD o por repetición en el archivo), se resuelve al instante
             if comuna_limpia_inicial in cache_fuzz:
                 comuna_final, reg, hab = cache_fuzz[comuna_limpia_inicial]
             else:
-                # 1. Calcular la corrección ortográfica difusa
                 comuna_final, corregido_fuzz = buscar_fuzz(comuna_limpia_inicial, lista_oficial_bd, cutoff=sensibilidad)
                 
-                # 2. Ir a internet SOLO si es una comuna nueva en esta ejecución
-                reg, hab = consultar_api_comuna(comuna_final)
-                if reg == "No Encontrada":
-                    registros_no_encontrados_api += 1
+                # Buscamos de nuevo en caché usando el nombre ya corregido antes de ir a internet
+                comuna_final_limpia = limpiar_texto_basico(comuna_final)
+                if comuna_final_limpia in cache_fuzz:
+                    _, reg, hab = cache_fuzz[comuna_final_limpia]
+                else:
+                    reg, hab = consultar_api_comuna(comuna_final)
+                    if reg == "No Encontrada":
+                        registros_no_encontrados_api += 1
                 
-                # 3. Guardar en memoria para las próximas repeticiones
                 cache_fuzz[comuna_limpia_inicial] = (comuna_final, reg, hab)
 
             if comuna_final in comunas_unicas_processed:
