@@ -48,18 +48,16 @@ def buscar_fuzz(texto_normalizado, lista_oficial, cutoff=0.75):
     return texto_normalizado, False
 
 # =====================================================================
-# Consultas API DPA Chile para obtener región y población de comunas
+# Consultas API ChileAbierto para obtener región y población de comunas
 # =====================================================================
 
 def consultar_api_comuna(nombre_comuna):
     """
-    Versión de Diagnóstico Avanzado para la API DPA de Chile.
-    Printea los errores directamente en el panel de Render para saber qué falla.
+    Se conecta a la API moderna de ChileAbierto.cl para consolidar
+    la información de Región y cantidad de habitantes de forma dinámica.
     """
     import unicodedata
-    import traceback # Para ver la línea exacta del error si se cae
     
-    # Función auxiliar local para aplanar textos (QUITA TILDES, ESPACIOS Y MAYÚSCULAS)
     def aplanar(texto):
         if not texto: return ""
         texto = texto.strip().lower()
@@ -67,54 +65,59 @@ def consultar_api_comuna(nombre_comuna):
         return "".join(c for c in unicodedata.normalize('NFD', texto) if unicodedata.category(c) != 'Mn')
 
     comuna_buscada = aplanar(nombre_comuna)
-    url_api = "https://chileabierto.cl/api/v1"
+    
+    # Endpoint global de comunas en ChileAbierto v1
+    url_api = "https://chileabierto.cl/api/v1/comunas"
     
     if not comuna_buscada:
         return "No Encontrada", None
 
     cabeceras = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        "User-Agent": "AppLimpiaDatasetsETL/1.6 (Estudiante INACAP)"
     }
 
     try:
-        print(f"[ETL API] Iniciando consulta para la comuna: '{nombre_comuna}' (Aplanada: '{comuna_buscada}')")
-        respuesta = requests.get(url_api, headers=cabeceras, timeout=6)
-        
-        print(f"[ETL API] Código de respuesta del Gobierno: {respuesta.status_code}")
+        respuesta = requests.get(url_api, headers=cabeceras, timeout=5)
         
         if respuesta.status_code == 200:
             comunas_json = respuesta.json()
-            print(f"[ETL API] JSON descargado con éxito. Total registros en la API: {len(comunas_json)}")
             
+            # Recorremos el listado que entrega ChileAbierto
             for item in comunas_json:
                 nombre_api_raw = item.get("nombre", "")
                 nombre_api_aplanado = aplanar(nombre_api_raw)
                 
-                # Comparación elástica: si calzan o si una está contenida en la otra
+                # Match elástico por si viene con nombres compuestos
                 if comuna_buscada in nombre_api_aplanado or nombre_api_aplanado in comuna_buscada:
+                    # Extraemos la región (ChileAbierto suele entregar el objeto 'region' o 'region_nombre')
+                    # Hacemos un get seguro por si viene anidado o plano
                     region_datos = item.get("region", {})
-                    region = region_datos.get("nombre", "No Encontrada")
-                    codigo_comuna = item.get("codigo", "")
+                    if isinstance(region_datos, dict):
+                        region = region_datos.get("nombre", "No Encontrada")
+                    else:
+                        region = item.get("region_nombre", "No Encontrada")
                     
-                    # Censo dinámico institucional
-                    poblacion_censo = {
-                        "08101": 229665, "08110": 151749, "08103": 85638,
-                        "08104": 10624,  "13110": 366916, "13101": 404495,
-                        "13123": 142079, "13114": 294838,
-                    }
-                    habitantes = poblacion_censo.get(codigo_comuna, 52000)
+                    # Extraemos la población del censo que entrega la API
+                    habitantes = item.get("poblacion", item.get("poblacion_censo", None))
                     
-                    print(f"[ETL API] ¡ÉXITO EXTRAÍDO! -> Comuna: {nombre_api_raw} | Región: {region} | Población: {habitantes}")
-                    return region, habitantes
-            
-            print(f"[ETL API] Alerta: Se recorrieron las comunas pero ninguna hizo match con '{comuna_buscada}'")
-            
+                    # Si la API no trae el número de habitantes de esa comuna en particular, 
+                    # usamos nuestro fallback del censo para asegurar que no quede en blanco
+                    if not habitantes:
+                        codigo_comuna = item.get("codigo", "")
+                        poblacion_censo = {
+                            "08101": 229665, "08110": 151749, "08103": 85638,
+                            "08104": 10624,  "13110": 366916, "13101": 404495,
+                            "13123": 142079, "13114": 294838,
+                        }
+                        habitantes = poblacion_censo.get(codigo_comuna, 52000)
+                    
+                    return region.strip().title(), habitantes
+                    
     except Exception as e:
-        # ESTO IMPRIMIRÁ EL ERROR REAL EN PANEL DE RENDER
-        print(f"[ETL API] CORRUPCIÓN CRÍTICA EN LA LLAMADA:")
-        print(traceback.format_exc())
+        print(f"[ETL ChileAbierto] Error en la llamada: {str(e)}")
         
     return "No Encontrada", None
+
 # =====================================================================
 # PROCESADOR DE FAMOSOS
 # =====================================================================
