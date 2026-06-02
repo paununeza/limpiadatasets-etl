@@ -477,16 +477,19 @@ class ProcesarComunasView(APIView):
         t_total = time.time() - t_inicio
         logs.append(f"=== ETL COMUNAS FINALIZADO EXITOSAMENTE EN {t_total:.2f} SEGUNDOS ===")
 
-        # 2. CONSULTA Y ORDENAMIENTO DE LA BASE DE DATOS PARA EL RETORNO
-        # Traemos los registros de este diccionario desde Neon Postgres
-        registros_comunas_bd = TerminoValido.objects.filter(diccionario=diccionario_obj)
+        # Extraemos la lista de nombres corregidos que se generaron en el bucle actual
+        nombres_procesados_ahora = [c["valor_oficial"] for c in comunas_finales_proceso]
+
+        # Filtramos en Neon Postgres para que traiga SOLAMENTE los elementos de esta ejecución
+        registros_comunas_bd = TerminoValido.objects.filter(
+            diccionario=diccionario_obj,
+            valor_oficial__in=nombres_procesados_ahora
+        )
         
-        # Si el usuario pidió ordenar, lo hacemos directamente en la consulta de base de datos
         if debe_ordenar:
             registros_comunas_bd = registros_comunas_bd.order_by('valor_oficial')
             
-        # 3. SERIALIZACIÓN FINAL
+        # SERIALIZACIÓN FINAL
         serializer = TerminoValidoSerializer(registros_comunas_bd, many=True)
 
-        # Mandamos tanto los logs de auditoría como la data serializada y ordenada a Vercel
         return Response({"logs": logs, "data": serializer.data})
