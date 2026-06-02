@@ -11,6 +11,10 @@ export default function App() {
   const [ordenar, setOrdenar] = useState(true);
   const [sensibilidad, setSensibilidad] = useState(0.70); // Control de umbral Fuzz
 
+  const [urlImagenFamoso, setUrlImagenFamoso] = useState(null);
+  const [famosoSeleccionado, setFamosoSeleccionado] = useState('');
+  const [buscandoFoto, setBuscandoFoto] = useState(false);
+
   const [logs, setLogs] = useState([]);
   const [datosResultado, setDatosResultado] = useState([]);
 
@@ -113,6 +117,35 @@ const ejecutarETL = async (e, esManual = false) => {
     link.setAttribute('download', nombreDescarga);
     link.click();
   };
+
+  const verImagenFamoso = async (nombreFamoso) => {
+  setBuscandoFoto(true);
+  setFamosoSeleccionado(nombreFamoso);
+  setUrlImagenFamoso(null);
+
+  // Endpoint público de la API de Wikipedia para obtener imágenes miniatura (Pageimages)
+  const urlApi = `https://es.wikipedia.org/w/api.php?action=query&titles=${encodeURIComponent(nombreFamoso)}&prop=pageimages&format=json&pithumbsize=400&origin=*`;
+
+  try {
+    const respuesta = await axios.get(urlApi);
+    const paginas = respuesta.data.query.pages;
+    const pageId = Object.keys(paginas)[0];
+    
+    if (pageId !== "-1" && paginas[pageId].thumbnail) {
+      // Encontrar la foto oficial
+      setUrlImagenFamoso(paginas[pageId].thumbnail.source);
+    } else {
+      // Imagen de respaldo si el famoso no tiene foto en su artículo
+      setUrlImagenFamoso('https://via.placeholder.com/400x400.png?text=Sin+Imagen+Oficial');
+    }
+  } catch (error) {
+    console.error("Error al buscar la imagen:", error);
+    setUrlImagenFamoso('https://via.placeholder.com/400x400.png?text=Error+de+Conexi%C3%B3n');
+  } finally {
+    setBuscandoFoto(false);
+  }
+};
+
 
   return (
     <div>
@@ -256,7 +289,7 @@ const ejecutarETL = async (e, esManual = false) => {
                   </tbody>
                 </table>
               ) : pestana === 'famosos' ? (
-                /* Renderizado de Tabla Famosos */
+                /* Renderizado de Tabla Famosos con Botón de Imagen */
                 <table>
                   <thead>
                     <tr>
@@ -264,6 +297,7 @@ const ejecutarETL = async (e, esManual = false) => {
                       <th>Fecha (DD-MM-YYYY)</th>
                       <th>Edad</th>
                       <th>¿Cumpleaños?</th>
+                      <th>Acciones</th> {/* <-- NUEVA COLUMNA */}
                     </tr>
                   </thead>
                   <tbody>
@@ -273,11 +307,21 @@ const ejecutarETL = async (e, esManual = false) => {
                         <td>{f.fecha_nacimiento_chile}</td>
                         <td style={{color: '#10b981', fontWeight: 'bold'}}>{f.edad}</td>
                         <td>{f.es_cumpleanos ? '🎉 SÍ' : 'NO'}</td>
+                        <td>
+                          <button 
+                            type="button" 
+                            className="btn"
+                            style={{ padding: '4px 10px', fontSize: '11px', backgroundColor: '#3b82f6', margin: 0 }}
+                            onClick={() => verImagenFamoso(f.nombre)}
+                          >
+                            Ver Imagen
+                          </button>
+                        </td>
                       </tr>
-                    ))}
-                  </tbody>
-                </table>
-              ) : (
+                      ))}
+                    </tbody>
+                  </table>
+                ) : (
                 /* Renderizado de Tabla Lugares Relacionales */
                 <table>
                   <thead>
@@ -304,6 +348,40 @@ const ejecutarETL = async (e, esManual = false) => {
             </div>
           </div>
         </div>
+
+        {famosoSeleccionado && (
+          <div style={{
+            position: 'fixed', top: 0, left: 0, width: '100%', height: '100%',
+            backgroundColor: 'rgba(0,0,0,0.8)', display: 'flex', justifyContent: 'center', alignItems: 'center', zIndex: 9999
+          }}>
+            <div className="card" style={{ maxWidth: '420px', width: '90%', textAlign: 'center', border: '3px solid #3b82f6', backgroundColor: '#111827' }}>
+              <h3 style={{ margin: '0 0 15px 0', color: 'white' }}>{famosoSeleccionado}</h3>
+              
+              {buscandoFoto ? (
+                <div style={{ height: '300px', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#9ca3af' }}>
+                  🔍 Buscando archivo en Wikimedia...
+                </div>
+              ) : (
+                <img 
+                  src={urlImagenFamoso} 
+                  alt={famosoSeleccionado} 
+                  style={{ width: '100%', height: '300px', objectFit: 'cover', borderRadius: '4px', border: '2px solid #4b5563' }}
+                />
+              )}
+              
+              <button 
+                type="button" 
+                className="btn btn-secondary" 
+                style={{ marginTop: '15px', width: '100%' }}
+                onClick={() => { setFamosoSeleccionado(''); setUrlImagenFamoso(null); }}
+              >
+                Cerrar Visor
+              </button>
+            </div>
+          </div>
+        )}
+
+
       </main>
     </div>
   );
