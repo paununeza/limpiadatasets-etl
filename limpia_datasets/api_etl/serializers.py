@@ -28,3 +28,8 @@ class LugarDetalleSerializer(serializers.ModelSerializer):
     class Meta:
         model = Lugar
         fields = ['id', 'nombre_lugar', 'georeferencia', 'direccion']
+
+class TerminoValidoSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = TerminoValido
+        fields = ['id', 'valor_oficial', 'region', 'habitantes']
