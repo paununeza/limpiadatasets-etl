@@ -385,25 +385,34 @@ export default function App() {
                         attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
                       />
                       
+                      {/* Animador de cámara dinámico */}
                       <CambiarCentroMapa centro={centroMapa} />
                       
-                      {datosResultado.map((l, i) => (
-                        l.georeferencia?.latitud && l.georeferencia?.longitud ? (
-                          <Marker position={[l.georeferencia.latitud, l.georeferencia.longitud]} key={i}>
-                            <Popup>
-                              <div style={{ color: '#111827' }}>
-                                <strong style={{ fontSize: '14px' }}>{l.nombre_lugar}</strong><br />
-                                <span style={{ fontSize: '12px', color: '#4b5563' }}>
-                                  {l.direccion?.nombre_calle} {l.direccion?.numero_calle}
-                                </span>
-                              </div>
-                            </Popup>
-                          </Marker>
-                        ) : null
-                      ))}
+                      {/* Solo mapeamos si estamos en la pestaña correcta y hay datos válidos */}
+                      {pestana === 'lugares' && datosResultado && datosResultado.map((l, i) => {
+                        // Verificamos de forma estricta que existan las coordenadas numéricas
+                        const tieneCoordenadas = l?.georeferencia && 
+                                                 typeof l.georeferencia.latitud === 'number' && 
+                                                 typeof l.georeferencia.longitud === 'number';
+                        
+                        if (tieneCoordenadas) {
+                          return (
+                            <Marker position={[l.georeferencia.latitud, l.georeferencia.longitud]} key={i}>
+                              <Popup>
+                                <div style={{ color: '#111827' }}>
+                                  <strong style={{ fontSize: '14px' }}>{l.nombre_lugar}</strong><br />
+                                  <span style={{ fontSize: '12px', color: '#4b5563' }}>
+                                    {l.direccion?.nombre_calle || 'Sin calle'} {l.direccion?.numero_calle || ''}
+                                  </span>
+                                </div>
+                              </Popup>
+                            </Marker>
+                          );
+                        }
+                        return null;
+                      })}
                     </MapContainer>
                   </div>
-
                   {/* TABLA RELACIONAL DE LUGARES */}
                   <table>
                     <thead>
