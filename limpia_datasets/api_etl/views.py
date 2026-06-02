@@ -10,7 +10,7 @@ from rest_framework.response import Response
 from rest_framework.parsers import MultiPartParser
 
 from .models import DiccionarioReferencia, TerminoValido, Famoso, Lugar, Georeferencia, Direccion
-from .serializers import FamosoSerializer, LugarDetalleSerializer
+from .serializers import FamosoSerializer, LugarDetalleSerializer, TerminoValidoSerializer
 
 # =====================================================================
 # UTILERÍAS COMPARTIDAS DE LIMPIEZA
@@ -464,20 +464,29 @@ class ProcesarComunasView(APIView):
         if nuevos_registros_bd:
             TerminoValido.objects.bulk_create(nuevos_registros_bd, batch_size=1000)
 
-        # AUDITORÍA DE LOGS
+        # 1. AUDITORÍA DE LOGS (Calculamos y agregamos los textos primero)
         total_unicas = len(comunas_unicas_processed)
         total_duplicados = total_lineas_leidas - total_unicas
 
         logs.append(f"[{datetime.now().strftime('%X')}] Auditoría: Se leyeron {total_lineas_leidas} registros.")
         logs.append(f"[{datetime.now().strftime('%X')}] Auditoría: Se procesaron {total_unicas} comunas únicas.")
         logs.append(f"[{datetime.now().strftime('%X')}] Auditoría: Se eliminaron {total_duplicados} registros duplicados.")
-        logs.append(f"[{datetime.now().strftime('%X')}] Auditoría: Se consolidaron {len(comunas_finales_proceso)} registros correctamente.")
+        logs.append(f"[{datetime.now().strftime('%X')}] Auditoría: Se consolidaron {total_unicas} registros correctamente.")
         logs.append(f"[{datetime.now().strftime('%X')}] Auditoría: {registros_no_encontrados_api} registros no encontrados en la fuente oficial de la API.")
-
-        if debe_ordenar:
-            comunas_finales_proceso.sort(key=lambda x: x["valor_oficial"])
 
         t_total = time.time() - t_inicio
         logs.append(f"=== ETL COMUNAS FINALIZADO EXITOSAMENTE EN {t_total:.2f} SEGUNDOS ===")
 
-        return Response({"logs": logs, "data": comunas_finales_proceso})
+        # 2. CONSULTA Y ORDENAMIENTO DE LA BASE DE DATOS PARA EL RETORNO
+        # Traemos los registros de este diccionario desde Neon Postgres
+        registros_comunas_bd = TerminoValido.objects.filter(diccionario=diccionario_obj)
+        
+        # Si el usuario pidió ordenar, lo hacemos directamente en la consulta de base de datos
+        if debe_ordenar:
+            registros_comunas_bd = registros_comunas_bd.order_by('valor_oficial')
+            
+        # 3. SERIALIZACIÓN FINAL
+        serializer = TerminoValidoSerializer(registros_comunas_bd, many=True)
+
+        # Mandamos tanto los logs de auditoría como la data serializada y ordenada a Vercel
+        return Response({"logs": logs, "data": serializer.data})
