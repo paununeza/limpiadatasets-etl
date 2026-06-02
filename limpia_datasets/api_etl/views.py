@@ -70,8 +70,8 @@ class ProcesarFamososView(APIView):
 
         logs = []
         
-        # Esta lista guardará los nombres de TODOS los famosos que deben mostrarse en el Frontend
-        nombres_a_desplegar = []
+        # AQUÍ GUARDAREMOS EXCLUSIVAMENTE LOS OBJETOS ÚNICOS DE ESTA CORRIDA
+        famosos_a_retornar = []
         
         anho_actual = 2026 
         mes_actual = datetime.now().month
@@ -80,13 +80,7 @@ class ProcesarFamososView(APIView):
         logs.append(f"=== ETL FAMOSOS INICIADO - TIMESTAMP UNIX: {int(time.time())} ===")
 
 
-        # Cargamos el historial de la BD para no duplicar inserciones en Postgres
-        registros_en_bd = set()
-        famosos_en_base_datos = Famoso.objects.values_list('nombre', 'fecha_nacimiento_original')
-        for nom, fec_orig in famosos_en_base_datos:
-            registros_en_bd.add((nom, fec_orig.lower().strip()))
-
-        # Set local exclusivo para eliminar los duplicados internos del archivo de texto
+        # Set de control local exclusivo para eliminar los duplicados internos del archivo actual
         duplicados_archivo_set = set()
 
         for idx, linea in enumerate(archivo, start=1):
@@ -109,24 +103,27 @@ class ProcesarFamososView(APIView):
             
             llave_registro = (nombre_final, fecha_raw.lower().strip())
 
-            # Está repetido dentro del mismo archivo de texto?
+            # 1. DETECCION DE DUPLICADOS EN EL ARCHIVO: Si viene repetido en el txt, se destruye al instante
             if llave_registro in duplicados_archivo_set:
                 logs.append(f"[{datetime.now().strftime('%X')}][LÍNEA {idx}] ELIMINADO: Registro idéntico duplicado en archivo para '{nombre_final}'.")
                 continue 
                 
             duplicados_archivo_set.add(llave_registro)
-            
-            # Guardamos el nombre para asegurar que APAREZCA en la tabla de la app
-            nombres_a_desplegar.append(nombre_final)
 
             if corregido_fuzz:
                 logs.append(f"[{datetime.now().strftime('%X')}][LÍNEA {idx}] FUZZ CORRECCIÓN: '{nombre_raw}' -> '{nombre_final}'")
 
-            # Ya existía en la base de datos de una ejecución pasada?
-            if llave_registro in registros_en_bd:
-                logs.append(f"[{datetime.now().strftime('%X')}][LÍNEA {idx}] PERSISTENCIA: '{nombre_final}' ya existe en Postgres. Omitiendo inserción redundante.")
-                continue # Nos saltamos el .create() para no duplicar en Neon, pero SÍ aparecerá en el archivo final
+            # 2. COMPROBACIÓN HISTÓRICA EN BASE DE DATOS:
+            # Buscamos si exactamente este personaje con esta fecha ya se guardó en el pasado
+            registro_existente = Famoso.objects.filter(nombre=nombre_final, fecha_nacimiento_original=fecha_raw).first()
+            
+            if registro_existente:
+                logs.append(f"[{datetime.now().strftime('%X')}][LÍNEA {idx}] PERSISTENCIA: '{nombre_final}' ya existe en Postgres. Cargando registro histórico.")
+                # Recuperamos el objeto viejo y lo metemos a la lista de salida de la sesión (sin duplicar en Neon)
+                famosos_a_retornar.append(registro_existente)
+                continue
 
+            # Si es 100% nuevo en la historia de la app, calculamos sus métricas de edad
             es_ac = any(x in fecha_raw.lower() for x in ["a.c.", "b.c."])
             fecha_chile = ""
             edad = 0
@@ -140,7 +137,6 @@ class ProcesarFamososView(APIView):
                     es_cumpleanos = (mes_actual == 1 and dia_actual == 1)
                 except Exception:
                     logs.append(f"[{datetime.now().strftime('%X')}][LÍNEA {idx}] Error en año a.C. Omitido.")
-                    if nombre_final in nombres_a_desplegar: nombres_a_desplegar.remove(nombre_final)
                     continue
             else:
                 try:
@@ -161,29 +157,25 @@ class ProcesarFamososView(APIView):
                         logs.append(f"[{datetime.now().strftime('%X')}][LÍNEA {idx}] PARSEO REPARADO: Se infirió el año '{anho_extraido}' de '{fecha_raw}'.")
                     else:
                         logs.append(f"[{datetime.now().strftime('%X')}][LÍNEA {idx}] Imposible parsear fecha '{fecha_raw}'. Omitido.")
-                        if nombre_final in nombres_a_desplegar: nombres_a_desplegar.remove(nombre_final)
                         continue
 
-            # Inserción limpia e histórica
-            Famoso.objects.create(
+            # Inserción controlada única
+            famoso_obj = Famoso.objects.create(
                 nombre=nombre_final,
                 fecha_nacimiento_original=fecha_raw,
                 fecha_nacimiento_chile=fecha_chile,
                 edad=int(edad),
                 es_cumpleanos=es_cumpleanos
             )
+            famosos_a_retornar.append(famoso_obj)
 
-        # CONSULTA DE RETORNO UNIFICADA:
-        # Buscamos en Postgres los objetos reales de los nombres que venían en este archivo
-        famosos_resultado = Famoso.objects.filter(nombre__in=nombres_a_desplegar)
-
+        # Ordenamiento elástico en memoria RAM para asegurar la consistencia del archivo de salida
         if debe_ordenar:
-            famosos_resultado = famosos_resultado.order_by('nombre')
+            famosos_a_retornar.sort(key=lambda x: x.nombre)
 
-        # Serializamos el set completo para enviarlo a React
-        serializer = FamosoSerializer(famosos_resultado, many=True)
+        # Serializamos únicamente este lote limpio aislado en la sesión
+        serializer = FamosoSerializer(famosos_a_retornar, many=True)
         return Response({"logs": logs, "data": serializer.data})
-
 
 # =====================================================================
 # PROCESADOR DE LUGARES
