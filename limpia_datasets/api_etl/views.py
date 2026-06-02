@@ -462,35 +462,30 @@ class ProcesarComunasView(APIView):
                     )
                 )
 
+        # Guardado masivo eficiente en la base de datos (Neon)
         if nuevos_registros_bd:
             TerminoValido.objects.bulk_create(nuevos_registros_bd, batch_size=1000)
 
-        # 1. AUDITORÍA DE LOGS (Calculamos y agregamos los textos primero)
+        # 1. AUDITORÍA DE LOGS EXIGIDA POR LA PAUTA
         total_unicas = len(comunas_unicas_processed)
         total_duplicados = total_lineas_leidas - total_unicas
 
         logs.append(f"[{datetime.now().strftime('%X')}] Auditoría: Se leyeron {total_lineas_leidas} registros.")
         logs.append(f"[{datetime.now().strftime('%X')}] Auditoría: Se procesaron {total_unicas} comunas únicas.")
         logs.append(f"[{datetime.now().strftime('%X')}] Auditoría: Se eliminaron {total_duplicados} registros duplicados.")
-        logs.append(f"[{datetime.now().strftime('%X')}] Auditoría: Se consolidaron {total_unicas} registros correctamente.")
+        logs.append(f"[{datetime.now().strftime('%X')}] Auditoría: Se consolidaron {len(comunas_finales_proceso)} registros correctamente.")
         logs.append(f"[{datetime.now().strftime('%X')}] Auditoría: {registros_no_encontrados_api} registros no encontrados en la fuente oficial de la API.")
+
+        # 2. ORDENAMIENTO EN MEMORIA ULTRA-RÁPIDO (Evita colapsar la RAM con Queries pesadas)
+        if debe_ordenar:
+            comunas_finales_proceso.sort(key=lambda x: x["valor_oficial"])
+
+        # 3. LIMITADOR DE VISTA PREVIA (Paginación de seguridad para el Frontend)
+        # Mostramos las primeras 100 comunas en la tabla y el resto queda guardado a salvo en la BD Postgres.
+        data_respuesta = comunas_finales_proceso[:100]
 
         t_total = time.time() - t_inicio
         logs.append(f"=== ETL COMUNAS FINALIZADO EXITOSAMENTE EN {t_total:.2f} SEGUNDOS ===")
 
-        # Extraemos la lista de nombres corregidos que se generaron en el bucle actual
-        nombres_procesados_ahora = [c["valor_oficial"] for c in comunas_finales_proceso]
-
-        # Filtramos en Neon Postgres para que traiga SOLAMENTE los elementos de esta ejecución
-        registros_comunas_bd = TerminoValido.objects.filter(
-            diccionario=diccionario_obj,
-            valor_oficial__in=nombres_procesados_ahora
-        )
-        
-        if debe_ordenar:
-            registros_comunas_bd = registros_comunas_bd.order_by('valor_oficial')
-            
-        # SERIALIZACIÓN FINAL
-        serializer = TerminoValidoSerializer(registros_comunas_bd, many=True)
-
-        return Response({"logs": logs, "data": serializer.data})
+        # Retornamos directamente los diccionarios limpios. ¡Cero consumo de RAM en Serializadores!
+        return Response({"logs": logs, "data": data_respuesta})
