@@ -70,8 +70,9 @@ class ProcesarFamososView(APIView):
 
         logs = []
         
-        # AQUÍ GUARDAREMOS EXCLUSIVAMENTE LOS OBJETOS ÚNICOS DE ESTA CORRIDA
-        famosos_a_retornar = []
+        # FIJACIÓN TÉCNICA: Aquí guardaremos los IDs únicos de la base de datos
+        # para que el serializador traiga exactamente una fila por personaje histórico
+        ids_famosos_a_retornar = []
         
         anho_actual = 2026 
         mes_actual = datetime.now().month
@@ -79,16 +80,8 @@ class ProcesarFamososView(APIView):
 
         logs.append(f"=== ETL FAMOSOS INICIADO - TIMESTAMP UNIX: {int(time.time())} ===")
 
-
-       # Sets de control histórico y de sesión para descarte absoluto
-        registros_en_bd = set()
+        # Set para eliminar duplicados internos del archivo actual
         duplicados_archivo_set = set()
-
-        # Cargamos el historial de la base de datos limpiando retornos de carro
-        famosos_en_base_datos = Famoso.objects.values_list('nombre', 'fecha_nacimiento_original')
-        for nom, fec_orig in famosos_en_base_datos:
-            fec_limpia_bd = fec_orig.replace('\r', '').replace('\n', '').strip().lower()
-            registros_en_bd.add((nom, fec_limpia_bd))
 
         for idx, linea in enumerate(archivo, start=1):
             linea_str = decodificar_linea(linea)
@@ -104,15 +97,13 @@ class ProcesarFamososView(APIView):
 
             partes_famoso = linea_limpia.split(" - ", 1)
             nombre_raw = partes_famoso[0].strip()
-
-            # Eliminamos saltos de línea ocultos (\r, \n) de raíz
             fecha_raw = partes_famoso[1].replace('\r', '').replace('\n', '').strip()
             
             nombre_final, corregido_fuzz = buscar_fuzz(limpiar_texto_basico(nombre_raw), lista_oficial)
             
             llave_registro = (nombre_final, fecha_raw.lower())
 
-            # 1. DETECCION DE DUPLICADOS EN EL ARCHIVO: Si viene repetido en el txt, se destruye al instante
+            # 1. Filtro estricto en memoria del archivo actual
             if llave_registro in duplicados_archivo_set:
                 logs.append(f"[{datetime.now().strftime('%X')}][LÍNEA {idx}] ELIMINADO: Registro idéntico duplicado en archivo para '{nombre_final}'.")
                 continue 
@@ -122,17 +113,17 @@ class ProcesarFamososView(APIView):
             if corregido_fuzz:
                 logs.append(f"[{datetime.now().strftime('%X')}][LÍNEA {idx}] FUZZ CORRECCIÓN: '{nombre_raw}' -> '{nombre_final}'")
 
-            # 2. COMPROBACIÓN HISTÓRICA EN BASE DE DATOS:
-            # Buscamos si exactamente este personaje con esta fecha ya se guardó en el pasado
+            # 2. Comprobación histórica en base de datos
+            # Buscamos si existe para rescatar su ID, pero no volvemos a insertar
             registro_existente = Famoso.objects.filter(nombre=nombre_final, fecha_nacimiento_original=fecha_raw).first()
             
-            if llave_registro in registros_en_bd or registro_existente:
-                logs.append(f"[{datetime.now().strftime('%X')}][LÍNEA {idx}] PERSISTENCIA: '{nombre_final}' ya existe en Postgres. Cargando registro histórico.")
-                if registro_existente and registro_existente not in famosos_a_retornar:
-                    famosos_a_retornar.append(registro_existente)
+            if registro_existente:
+                logs.append(f"[{datetime.now().strftime('%X')}][LÍNEA {idx}] PERSISTENCIA: '{nombre_final}' ya existe en Postgres. Cargando ID de referencia.")
+                # Evitamos duplicar en el archivo: Solo agregamos el ID si no lo habíamos metido ya en esta corrida
+                if registro_existente.id not in ids_famosos_a_retornar:
+                    ids_famosos_a_retornar.append(registro_existente.id)
                 continue
 
-            # Si es 100% nuevo en la historia de la app, calculamos sus métricas de edad
             es_ac = any(x in fecha_raw.lower() for x in ["a.c.", "b.c."])
             fecha_chile = ""
             edad = 0
@@ -170,7 +161,7 @@ class ProcesarFamososView(APIView):
                         duplicados_archivo_set.remove(llave_registro)
                         continue
 
-            # Inserción única y limpia
+            # Inserción limpia de un registro verdaderamente nuevo
             famoso_obj = Famoso.objects.create(
                 nombre=nombre_final,
                 fecha_nacimiento_original=fecha_raw,
@@ -178,14 +169,16 @@ class ProcesarFamososView(APIView):
                 edad=int(edad),
                 es_cumpleanos=es_cumpleanos
             )
-            famosos_a_retornar.append(famoso_obj)
+            ids_famosos_a_retornar.append(famoso_obj.id)
 
-        # Ordenamiento elástico en memoria RAM para asegurar la consistencia del archivo de salida
+        # CONSULTA DE RETORNO BLINDADA POR ID ÚNICO DE INSTANCIA
+        # Filtramos explícitamente por la lista de IDs recolectados. Esto ignora cualquier duplicado del pasado histórico.
+        famosos_resultado = Famoso.objects.filter(id__in=ids_famosos_a_retornar)
+
         if debe_ordenar:
-            famosos_a_retornar.sort(key=lambda x: x.nombre)
+            famosos_resultado = famosos_resultado.order_by('nombre')
 
-        # Serializamos únicamente este lote limpio aislado en la sesión
-        serializer = FamosoSerializer(famosos_a_retornar, many=True)
+        serializer = FamosoSerializer(famosos_resultado, many=True)
         return Response({"logs": logs, "data": serializer.data})
 
 # =====================================================================
