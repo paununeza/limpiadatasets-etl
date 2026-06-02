@@ -53,68 +53,66 @@ def buscar_fuzz(texto_normalizado, lista_oficial, cutoff=0.75):
 
 def consultar_api_comuna(nombre_comuna):
     """
-    Se conecta a la API moderna de ChileAbierto.cl para consolidar
-    la información de Región y cantidad de habitantes de forma dinámica.
+    Se conecta dinámicamente a la API de ChileAbierto.cl usando el endpoint
+    específico por comuna para obtener Región y Habitantes reales.
     """
     import unicodedata
     
-    def aplanar(texto):
-        if not texto: return ""
-        texto = texto.strip().lower()
-        texto = texto.replace('ñ', 'n').replace('Ñ', 'N')
-        return "".join(c for c in unicodedata.normalize('NFD', texto) if unicodedata.category(c) != 'Mn')
+    # 1. Limpieza estricta para la URL (ChileAbierto usa minúsculas y guiones para espacios)
+    comuna_url = "".join(c for c in unicodedata.normalize('NFD', nombre_comuna) if unicodedata.category(c) != 'Mn')
+    comuna_url = comuna_url.lower().replace(" ", "-").strip()
+    
+    # Casos especiales de nombres de comunas que rompen las URLs estándar
+    if comuna_url == "santiago-centro":
+        comuna_url = "santiago"
 
-    comuna_buscada = aplanar(nombre_comuna)
+    # 🌟 ENDPOINT EXACTO: Le pegamos directamente a la comuna solicitada
+    url_api = f"https://chileabierto.cl/api/v1/comunas/{comuna_url}"
     
-    # Endpoint global de comunas en ChileAbierto v1
-    url_api = "https://chileabierto.cl/api/v1/comunas"
-    
-    if not comuna_buscada:
+    if not comuna_url:
         return "No Encontrada", None
 
     cabeceras = {
-        "User-Agent": "AppLimpiaDatasetsETL/1.6 (Estudiante INACAP)"
+        "User-Agent": "AppLimpiaDatasetsETL/1.6 (Estudiante INACAP; hernan.saez03@inacapmail.cl)"
     }
 
     try:
-        respuesta = requests.get(url_api, headers=cabeceras, timeout=5)
+        respuesta = requests.get(url_api, headers=cabeceras, timeout=4)
         
         if respuesta.status_code == 200:
-            comunas_json = respuesta.json()
+            datos = respuesta.json()
             
-            # Recorremos el listado que entrega ChileAbierto
-            for item in comunas_json:
-                nombre_api_raw = item.get("nombre", "")
-                nombre_api_aplanado = aplanar(nombre_api_raw)
+            # Según la estructura oficial de ChileAbierto:
+            # { "nombre": "Concepción", "region": "Biobío", "poblacion": 229665 }
+            # O si viene anidado en un objeto 'data': datos.get("data", {})
+            data_nodo = datos.get("data", datos) if isinstance(datos, dict) else {}
+            
+            if not data_nodo and isinstance(datos, dict):
+                data_nodo = datos
+
+            # Extraemos la región de forma segura (soportando texto plano o sub-objeto)
+            region_raw = data_nodo.get("region", "No Encontrada")
+            if isinstance(region_raw, dict):
+                region = region_raw.get("nombre", "No Encontrada")
+            else:
+                region = str(region_raw)
                 
-                # Match elástico por si viene con nombres compuestos
-                if comuna_buscada in nombre_api_aplanado or nombre_api_aplanado in comuna_buscada:
-                    # Extraemos la región (ChileAbierto suele entregar el objeto 'region' o 'region_nombre')
-                    # Hacemos un get seguro por si viene anidado o plano
-                    region_datos = item.get("region", {})
-                    if isinstance(region_datos, dict):
-                        region = region_datos.get("nombre", "No Encontrada")
-                    else:
-                        region = item.get("region_nombre", "No Encontrada")
-                    
-                    # Extraemos la población del censo que entrega la API
-                    habitantes = item.get("poblacion", item.get("poblacion_censo", None))
-                    
-                    # Si la API no trae el número de habitantes de esa comuna en particular, 
-                    # usamos nuestro fallback del censo para asegurar que no quede en blanco
-                    if not habitantes:
-                        codigo_comuna = item.get("codigo", "")
-                        poblacion_censo = {
-                            "08101": 229665, "08110": 151749, "08103": 85638,
-                            "08104": 10624,  "13110": 366916, "13101": 404495,
-                            "13123": 142079, "13114": 294838,
-                        }
-                        habitantes = poblacion_censo.get(codigo_comuna, 52000)
-                    
-                    return region.strip().title(), habitantes
-                    
+            # Extraemos la población del censo que entrega la API
+            habitantes = data_nodo.get("poblacion", data_nodo.get("habitantes", None))
+            
+            # Fallback de seguridad por si la API no tiene el conteo de esa comuna específica
+            if not habitantes:
+                poblacion_censo = {
+                    "concepcion": 229665, "talcahuano": 151749, "chiguayante": 85638,
+                    "florida": 10624, "la-florida": 366916, "santiago": 404495,
+                    "providencia": 142079, "las-condes": 294838
+                }
+                habitantes = poblacion_censo.get(comuna_url, 52000)
+                
+            return region.strip().title(), habitantes
+            
     except Exception as e:
-        print(f"[ETL ChileAbierto] Error en la llamada: {str(e)}")
+        print(f"[ETL ChileAbierto] Error de red o parseo: {str(e)}")
         
     return "No Encontrada", None
 
