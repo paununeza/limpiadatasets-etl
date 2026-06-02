@@ -69,10 +69,7 @@ class ProcesarFamososView(APIView):
             lista_oficial = list(TerminoValido.objects.filter(diccionario_id=diccionario_id).values_list('valor_oficial', flat=True))
 
         logs = []
-        
-        # FIJACIÓN TÉCNICA: Aquí guardaremos los IDs únicos de la base de datos
-        # para que el serializador traiga exactamente una fila por personaje histórico
-        ids_famosos_a_retornar = []
+        famosos_a_retornar = []
         
         anho_actual = 2026 
         mes_actual = datetime.now().month
@@ -80,8 +77,14 @@ class ProcesarFamososView(APIView):
 
         logs.append(f"=== ETL FAMOSOS INICIADO - TIMESTAMP UNIX: {int(time.time())} ===")
 
-        # Set para eliminar duplicados internos del archivo actual
+        # Sets de control para exclusión única
+        registros_en_bd = set()
         duplicados_archivo_set = set()
+
+        # Cargamos el historial de la base de datos de Neon
+        famosos_en_base_datos = Famoso.objects.values_list('nombre', 'fecha_nacimiento_chile')
+        for nom, fec_chile in famosos_en_base_datos:
+            registros_en_bd.add((nom, fec_chile.strip()))
 
         for idx, linea in enumerate(archivo, start=1):
             linea_str = decodificar_linea(linea)
@@ -101,50 +104,28 @@ class ProcesarFamososView(APIView):
             
             nombre_final, corregido_fuzz = buscar_fuzz(limpiar_texto_basico(nombre_raw), lista_oficial)
             
-            llave_registro = (nombre_final, fecha_raw.lower())
-
-            # 1. Filtro estricto en memoria del archivo actual
-            if llave_registro in duplicados_archivo_set:
-                logs.append(f"[{datetime.now().strftime('%X')}][LÍNEA {idx}] ELIMINADO: Registro idéntico duplicado en archivo para '{nombre_final}'.")
-                continue 
-                
-            duplicados_archivo_set.add(llave_registro)
-
-            if corregido_fuzz:
-                logs.append(f"[{datetime.now().strftime('%X')}][LÍNEA {idx}] FUZZ CORRECCIÓN: '{nombre_raw}' -> '{nombre_final}'")
-
-            # 2. Comprobación histórica en base de datos
-            # Buscamos si existe para rescatar su ID, pero no volvemos a insertar
-            registro_existente = Famoso.objects.filter(nombre=nombre_final, fecha_nacimiento_original=fecha_raw).first()
-            
-            if registro_existente:
-                logs.append(f"[{datetime.now().strftime('%X')}][LÍNEA {idx}] PERSISTENCIA: '{nombre_final}' ya existe en Postgres. Cargando ID de referencia.")
-                # Evitamos duplicar en el archivo: Solo agregamos el ID si no lo habíamos metido ya en esta corrida
-                if registro_existente.id not in ids_famosos_a_retornar:
-                    ids_famosos_a_retornar.append(registro_existente.id)
-                continue
-
+            # Normalizamos la fecha de inmediato para la validación
             es_ac = any(x in fecha_raw.lower() for x in ["a.c.", "b.c."])
-            fecha_chile = ""
+            fecha_chile_control = ""
             edad = 0
             es_cumpleanos = False
 
             if es_ac:
                 try:
                     anho_ac = int(re.search(r'\d+', fecha_raw).group())
-                    fecha_chile = f"01-01-{anho_ac:04d} a.C."
+                    fecha_chile_control = f"01-01-{anho_ac:04d} a.C."
                     edad = anho_actual + anho_ac
                     es_cumpleanos = (mes_actual == 1 and dia_actual == 1)
                 except Exception:
                     logs.append(f"[{datetime.now().strftime('%X')}][LÍNEA {idx}] Error en año a.C. Omitido.")
-                    duplicados_archivo_set.remove(llave_registro)
                     continue
             else:
                 try:
-                    fecha_normalizada = fecha_raw.replace('/', '-')
-                    dt_nacimiento = parser.parse(fecha_normalizada, dayfirst=True)
+                    # Limpiamos espacios intermedios raros y homogeneizamos separadores
+                    fecha_limpia_regex = re.sub(r'\s+', '', fecha_raw).replace('/', '-')
+                    dt_nacimiento = parser.parse(fecha_limpia_regex, dayfirst=True)
                     
-                    fecha_chile = dt_nacimiento.strftime("%d-%m-%Y")
+                    fecha_chile_control = dt_nacimiento.strftime("%d-%m-%Y")
                     edad = anho_actual - dt_nacimiento.year - ((mes_actual, dia_actual) < (dt_nacimiento.month, dt_nacimiento.day))
                     es_cumpleanos = (mes_actual == dt_nacimiento.month and dia_actual == dt_nacimiento.day)
                     
@@ -152,33 +133,50 @@ class ProcesarFamososView(APIView):
                     match_anho = re.search(r'\b\d{3,4}\b', fecha_raw)
                     if match_anho:
                         anho_extraido = int(match_anho.group())
-                        fecha_chile = f"01-01-{anho_extraido:04d}"
+                        fecha_chile_control = f"01-01-{anho_extraido:04d}"
                         edad = anho_actual - anho_extraido
                         es_cumpleanos = (mes_actual == 1 and dia_actual == 1)
                         logs.append(f"[{datetime.now().strftime('%X')}][LÍNEA {idx}] PARSEO REPARADO: Se infirió el año '{anho_extraido}' de '{fecha_raw}'.")
                     else:
                         logs.append(f"[{datetime.now().strftime('%X')}][LÍNEA {idx}] Imposible parsear fecha '{fecha_raw}'. Omitido.")
-                        duplicados_archivo_set.remove(llave_registro)
                         continue
 
-            # Inserción limpia de un registro verdaderamente nuevo
+            # LA LLAVE DE CONTROL AHORA USA LA FECHA NORMALIZADA "DD-MM-YYYY"
+            llave_registro = (nombre_final, fecha_chile_control)
+
+            # 1. ¿Está repetido en esta sesión? (Ahora sí va a cazar variaciones de barra/guión de texto)
+            if llave_registro in duplicados_archivo_set:
+                logs.append(f"[{datetime.now().strftime('%X')}][LÍNEA {idx}] ELIMINADO: Registro idéntico duplicado para '{nombre_final}' ({fecha_chile_control}).")
+                continue 
+                
+            duplicados_archivo_set.add(llave_registro)
+
+            if corregido_fuzz:
+                logs.append(f"[{datetime.now().strftime('%X')}][LÍNEA {idx}] FUZZ CORRECCIÓN: '{nombre_raw}' -> '{nombre_final}'")
+
+            # 2. ¿Existe en la persistencia histórica de Neon?
+            registro_existente = Famoso.objects.filter(nombre=nombre_final, fecha_nacimiento_chile=fecha_chile_control).first()
+            
+            if llave_registro in registros_en_bd or registro_existente:
+                logs.append(f"[{datetime.now().strftime('%X')}][LÍNEA {idx}] PERSISTENCIA: '{nombre_final}' ya existe en Postgres. Cargando ID de referencia.")
+                if registro_existente and registro_existente.id not in [f.id for f in famosos_a_retornar]:
+                    famosos_a_retornar.append(registro_existente)
+                continue
+
+            # Inserción controlada si el registro es 100% único e inédito
             famoso_obj = Famoso.objects.create(
                 nombre=nombre_final,
                 fecha_nacimiento_original=fecha_raw,
-                fecha_nacimiento_chile=fecha_chile,
+                fecha_nacimiento_chile=fecha_chile_control,
                 edad=int(edad),
                 es_cumpleanos=es_cumpleanos
             )
-            ids_famosos_a_retornar.append(famoso_obj.id)
-
-        # CONSULTA DE RETORNO BLINDADA POR ID ÚNICO DE INSTANCIA
-        # Filtramos explícitamente por la lista de IDs recolectados. Esto ignora cualquier duplicado del pasado histórico.
-        famosos_resultado = Famoso.objects.filter(id__in=ids_famosos_a_retornar)
+            famosos_a_retornar.append(famoso_obj)
 
         if debe_ordenar:
-            famosos_resultado = famosos_resultado.order_by('nombre')
+            famosos_a_retornar.sort(key=lambda x: x.nombre)
 
-        serializer = FamosoSerializer(famosos_resultado, many=True)
+        serializer = FamosoSerializer(famosos_a_retornar, many=True)
         return Response({"logs": logs, "data": serializer.data})
 
 # =====================================================================
