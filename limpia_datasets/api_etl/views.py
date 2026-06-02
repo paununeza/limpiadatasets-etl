@@ -67,7 +67,7 @@ def consultar_api_comuna(nombre_comuna):
         return "".join(c for c in unicodedata.normalize('NFD', texto) if unicodedata.category(c) != 'Mn')
 
     comuna_buscada = aplanar(nombre_comuna)
-    url_api = "https://apis.digital.gob.cl/dpa/comunas"
+    url_api = "https://chileabierto.cl/api/v1"
     
     if not comuna_buscada:
         return "No Encontrada", None
