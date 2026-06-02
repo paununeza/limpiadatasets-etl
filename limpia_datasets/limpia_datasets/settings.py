@@ -129,4 +129,5 @@ DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 CORS_ALLOWED_ORIGINS = [
     "https://limpiadatasets-etl.vercel.app",  # URL real de Vercel
     "http://localhost:5173",               # Para probar en local
+    "http://127.0.0.1:5173",
 ]

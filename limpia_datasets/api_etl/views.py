@@ -35,6 +35,19 @@ def limpiar_texto_basico(texto):
     texto = quitar_tildes(texto)
     return texto.lower().title()
 
+def parsear_georeferencia(georef_raw):
+    """Extrae lat/lon de textos como '37.422, -122.084' o '48.8584, 2.2945'."""
+    texto = (georef_raw or "").strip()
+    if not texto:
+        return None, None
+    numeros = re.findall(r'-?\d+(?:\.\d+)?', texto)
+    if len(numeros) >= 2:
+        try:
+            return float(numeros[0]), float(numeros[1])
+        except ValueError:
+            pass
+    return None, None
+
 def buscar_fuzz(texto_normalizado, lista_oficial, cutoff=0.75):
     """Aplica lógica difusa contra la lista de referencia si existe."""
     if not lista_oficial:
@@ -205,7 +218,28 @@ class GuardarImagenFamosoView(APIView):
 class ProcesarLugaresView(APIView):
     parser_classes = [MultiPartParser]
 
+    def _listar_todos_los_lugares(self, request):
+        ordenar_param = request.query_params.get('ordenar', request.data.get('ordenar', 'true'))
+        debe_ordenar = str(ordenar_param).lower() in ('true', '1', 'yes')
+
+        lugares_qs = Lugar.objects.select_related('georeferencia', 'direccion').all()
+        if debe_ordenar:
+            lugares_qs = lugares_qs.order_by('nombre_lugar')
+
+        serializer = LugarDetalleSerializer(lugares_qs, many=True)
+        return Response({
+            "logs": [f"Consulta global de lugares: {lugares_qs.count()} registros cargados."],
+            "data": serializer.data
+        })
+
+    def get(self, request):
+        return self._listar_todos_los_lugares(request)
+
     def post(self, request):
+        listar_todos = request.data.get('listar_todos')
+        if str(listar_todos).lower() in ('true', '1', 'yes'):
+            return self._listar_todos_los_lugares(request)
+
         archivo = request.FILES.get('archivo')
         ordenar_param = request.data.get('ordenar')
         debe_ordenar = ordenar_param == 'true' or ordenar_param is True
@@ -214,8 +248,12 @@ class ProcesarLugaresView(APIView):
             return Response({"error": "No se ha subido ningún archivo"}, status=400)
 
         logs = []
-        lugares_procesados = []
+        lugares_procesados_ids = []
         lugares_unicos = set()
+        lineas_leidas = 0
+        duplicados_omitidos = 0
+        sin_coordenadas = 0
+        con_coordenadas_ok = 0
 
         logs.append(f"=== ETL LUGARES INICIADO - TIMESTAMP UNIX: {int(time.time())} ===")
 
@@ -225,29 +263,32 @@ class ProcesarLugaresView(APIView):
             if not linea_str or "Nombre del lugar;" in linea_str: 
                 continue
 
-            partes = linea_str.split(';')
+            partes = [p.strip() for p in linea_str.split(';')]
             if len(partes) < 3:
+                logs.append(f"[{datetime.now().strftime('%X')}][LÍNEA {idx}] Formato inválido (se requieren 3 columnas).")
                 continue
 
+            lineas_leidas += 1
             nombre_lugar_raw = partes[0]
-            direccion_completa_raw = partes[1]
-            georef_raw = partes[2]
+            georef_raw = partes[-1]
+            direccion_completa_raw = ";".join(partes[1:-1]).strip()
 
             nombre_lugar = limpiar_texto_basico(nombre_lugar_raw)
+            llave_unica = (nombre_lugar, direccion_completa_raw.lower())
 
-            if nombre_lugar in lugares_unicos:
+            if llave_unica in lugares_unicos:
+                duplicados_omitidos += 1
+                logs.append(f"[{datetime.now().strftime('%X')}][LÍNEA {idx}] DUPLICADO omitido: '{nombre_lugar}'.")
                 continue
             
-            lugares_unicos.add(nombre_lugar)
+            lugares_unicos.add(llave_unica)
 
-            lat, lon = None, None
-            try:
-                if "," in georef_raw:
-                    lat_str, lon_str = georef_raw.split(",", 1)
-                    lat = float(lat_str.strip())
-                    lon = float(lon_str.strip()) if lon_str.strip() else None
-            except ValueError:
-                pass
+            lat, lon = parsear_georeferencia(georef_raw)
+            if lat is None or lon is None:
+                sin_coordenadas += 1
+                logs.append(f"[{datetime.now().strftime('%X')}][LÍNEA {idx}] Sin coordenadas válidas en '{georef_raw}'.")
+            else:
+                con_coordenadas_ok += 1
 
             # Segmentamos los bloques de la dirección por comas
             componentes_dir = [c.strip() for c in direccion_completa_raw.split(',')]
@@ -294,12 +335,20 @@ class ProcesarLugaresView(APIView):
                 pais=pais
             )
 
-            lugares_procesados.append(lugar_obj)
+            lugares_procesados_ids.append(lugar_obj.id)
+            logs.append(f"[{datetime.now().strftime('%X')}][LÍNEA {idx}] OK: '{nombre_lugar}' ({lat}, {lon}).")
 
+        logs.append(f"[{datetime.now().strftime('%X')}] Auditoría: {lineas_leidas} filas leídas.")
+        logs.append(f"[{datetime.now().strftime('%X')}] Auditoría: {len(lugares_procesados_ids)} lugares insertados.")
+        logs.append(f"[{datetime.now().strftime('%X')}] Auditoría: {con_coordenadas_ok} con coordenadas para el mapa.")
+        logs.append(f"[{datetime.now().strftime('%X')}] Auditoría: {duplicados_omitidos} duplicados omitidos.")
+        logs.append(f"[{datetime.now().strftime('%X')}] Auditoría: {sin_coordenadas} sin coordenadas válidas.")
+
+        lugares_qs = Lugar.objects.filter(id__in=lugares_procesados_ids).select_related('georeferencia', 'direccion')
         if debe_ordenar:
-            lugares_procesados.sort(key=lambda x: x.nombre_lugar)
+            lugares_qs = lugares_qs.order_by('nombre_lugar')
 
-        serializer = LugarDetalleSerializer(lugares_procesados, many=True)
+        serializer = LugarDetalleSerializer(lugares_qs, many=True)
         return Response({"logs": logs, "data": serializer.data})
 
 

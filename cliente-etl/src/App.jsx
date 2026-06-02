@@ -1,5 +1,16 @@
-import React, { useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import axios from 'axios';
+
+const API_BASE = (import.meta.env.VITE_API_BASE_URL || 'https://limpiadatasets-etl.onrender.com').replace(/\/$/, '');
+const apiUrl = (ruta) => `${API_BASE}/api/etl/${ruta}`;
+
+function extraerCoordenadas(georeferencia) {
+  if (!georeferencia) return null;
+  const lat = Number(georeferencia.latitud);
+  const lon = Number(georeferencia.longitud);
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
+  return { lat, lon };
+}
 
 // Importaciones de Leaflet para el Mapa
 import { MapContainer, TileLayer, Marker, Popup, useMap } from 'react-leaflet';
@@ -16,9 +27,24 @@ L.Marker.prototype.options.icon = DefaultIcon;
 // Componente controlador para mover la cámara del mapa de forma fluida
 function CambiarCentroMapa({ centro }) {
   const mapa = useMap();
-  if (centro) {
-    mapa.flyTo(centro, 14, { duration: 1.5 }); // Mueve la cámara en 1.5 segundos con un zoom de 14
-  }
+  useEffect(() => {
+    if (!centro) return;
+    mapa.flyTo(centro, 14, { duration: 1.5 });
+  }, [centro, mapa]);
+  return null;
+}
+
+function AjustarVistaMapa({ puntos, activar }) {
+  const mapa = useMap();
+  useEffect(() => {
+    if (!activar || !puntos?.length) return;
+    if (puntos.length === 1) {
+      mapa.setView([puntos[0].lat, puntos[0].lon], 10);
+      return;
+    }
+    const bounds = L.latLngBounds(puntos.map((p) => [p.lat, p.lon]));
+    mapa.fitBounds(bounds, { padding: [48, 48], maxZoom: 12 });
+  }, [activar, puntos, mapa]);
   return null;
 }
 
@@ -41,6 +67,129 @@ export default function App() {
   const [logs, setLogs] = useState([]);
   const [datosResultado, setDatosResultado] = useState([]);
   const [centroMapa, setCentroMapa] = useState(null); // Estado para rastrear el marcador seleccionado en la tabla
+  const [lugarSeleccionadoId, setLugarSeleccionadoId] = useState(null);
+  const [busquedaLugar, setBusquedaLugar] = useState('');
+  const [cargandoLugares, setCargandoLugares] = useState(false);
+  const [errorLugares, setErrorLugares] = useState('');
+  const [ajustarVistaMapa, setAjustarVistaMapa] = useState(0);
+
+  const lugaresConCoordenadas = useMemo(
+    () => datosResultado.filter((l) => extraerCoordenadas(l.georeferencia)),
+    [datosResultado]
+  );
+
+  const lugaresFiltrados = useMemo(() => {
+    const filtro = busquedaLugar.trim().toLowerCase();
+    if (!filtro) return datosResultado;
+
+    return datosResultado.filter((l) => {
+      const nombre = l.nombre_lugar?.toLowerCase() || '';
+      const calle = l.direccion?.nombre_calle?.toLowerCase() || '';
+      const ciudad = l.direccion?.ciudad_estado_provincia?.toLowerCase() || '';
+      const pais = l.direccion?.pais?.toLowerCase() || '';
+      return (
+        nombre.includes(filtro) ||
+        calle.includes(filtro) ||
+        ciudad.includes(filtro) ||
+        pais.includes(filtro)
+      );
+    });
+  }, [busquedaLugar, datosResultado]);
+
+  const lugaresEnMapa = useMemo(
+    () =>
+      lugaresFiltrados
+        .map((l) => {
+          const coords = extraerCoordenadas(l.georeferencia);
+          if (!coords) return null;
+          return { ...l, lat: coords.lat, lon: coords.lon };
+        })
+        .filter(Boolean),
+    [lugaresFiltrados]
+  );
+
+  const irAlLugar = (lugar) => {
+    const coords = extraerCoordenadas(lugar?.georeferencia);
+    if (!coords) return;
+    setLugarSeleccionadoId(lugar.id);
+    setCentroMapa([coords.lat, coords.lon]);
+  };
+
+  const abrirRutaExterna = (lugar) => {
+    const coords = extraerCoordenadas(lugar?.georeferencia);
+    const destino = coords
+      ? `${coords.lat},${coords.lon}`
+      : encodeURIComponent(
+          `${lugar?.direccion?.nombre_calle || ''} ${lugar?.direccion?.numero_calle || ''}, ${lugar?.direccion?.ciudad_estado_provincia || ''}, ${lugar?.direccion?.pais || ''}`
+        );
+    window.open(`https://www.google.com/maps/dir/?api=1&destination=${destino}`, '_blank', 'noopener,noreferrer');
+  };
+
+  const aplicarRespuestaLugares = (payload) => {
+    setLogs(payload.logs || []);
+    setDatosResultado(payload.data || []);
+    setCentroMapa(null);
+    setLugarSeleccionadoId(null);
+  };
+
+  const mensajeErrorLugares = (error) => {
+    if (error.code === 'ERR_NETWORK' || error.message?.includes('Network Error')) {
+      return `No hay conexión con ${API_BASE}. Si usas local, ejecuta: python manage.py runserver`;
+    }
+    const status = error.response?.status;
+    if (status === 405) {
+      return 'El backend en Render aún no tiene el listado global (405). Haz deploy del backend o usa API local en .env.local.';
+    }
+    return `No se pudo cargar el historial (${status || 'error desconocido'}).`;
+  };
+
+  const cargarTodosLosLugares = async ({ silencioso = false } = {}) => {
+    setCargandoLugares(true);
+    setErrorLugares('');
+    try {
+      const respuesta = await axios.get(apiUrl('lugares/'), {
+        params: { ordenar: true },
+        timeout: 20000,
+      });
+      aplicarRespuestaLugares(respuesta.data);
+      return true;
+    } catch (errorGet) {
+      const statusGet = errorGet.response?.status;
+
+      if (statusGet === 405) {
+        try {
+          const formData = new FormData();
+          formData.append('listar_todos', 'true');
+          formData.append('ordenar', 'true');
+          const respuesta = await axios.post(apiUrl('lugares/'), formData, { timeout: 20000 });
+          aplicarRespuestaLugares(respuesta.data);
+          return true;
+        } catch (errorPost) {
+          console.error(errorPost);
+          const msg = mensajeErrorLugares(errorPost);
+          setErrorLugares(msg);
+          setLogs((prev) => [...prev, `AVISO: ${msg}`]);
+          if (!silencioso) alert(msg);
+          return false;
+        }
+      }
+
+      console.error(errorGet);
+      const msg = mensajeErrorLugares(errorGet);
+      setErrorLugares(msg);
+      setLogs((prev) => [...prev, `AVISO: ${msg}`]);
+      if (!silencioso) alert(msg);
+      return false;
+    } finally {
+      setCargandoLugares(false);
+    }
+  };
+
+  useEffect(() => {
+    if (pestana === 'lugares') {
+      cargarTodosLosLugares({ silencioso: true });
+    }
+  }, [pestana]);
 
   const handleCambioArchivo = (e) => {
     setArchivo(e.target.files[0]);
@@ -76,10 +225,9 @@ export default function App() {
       formData.append('archivo_oficial', archivoOficial);
     }
 
-    // URL de producción oficial en Render
-    let url = 'https://limpiadatasets-etl.onrender.com/api/etl/comunas/';
-    if (pestana === 'famosos') url = 'https://limpiadatasets-etl.onrender.com/api/etl/famosos/';
-    if (pestana === 'lugares') url = 'https://limpiadatasets-etl.onrender.com/api/etl/lugares/';
+    let url = apiUrl('comunas/');
+    if (pestana === 'famosos') url = apiUrl('famosos/');
+    if (pestana === 'lugares') url = apiUrl('lugares/');
 
     try {
       // Usamos AXIOS
@@ -89,6 +237,12 @@ export default function App() {
       
       setLogs(respuesta.data.logs);
       setDatosResultado(respuesta.data.data);
+      if (pestana === 'lugares') {
+        setCentroMapa(null);
+        setLugarSeleccionadoId(null);
+        setAjustarVistaMapa(Date.now());
+        setErrorLugares('');
+      }
       
       if (esManual) setComunaManual(''); // Limpia el cuadro de texto si fue exitoso
     } catch (error) {
@@ -182,7 +336,7 @@ export default function App() {
       setFuenteImagen(imgFuente);
       setFechaCaptura(imgFecha);
 
-      await axios.post('https://limpiadatasets-etl.onrender.com/api/etl/famosos/guardar-imagen/', {
+      await axios.post(apiUrl('famosos/guardar-imagen/'), {
         id: famosoObj.id,
         imagen_url: imgUrl,
         imagen_fuente: imgFuente,
@@ -214,7 +368,7 @@ export default function App() {
           <div className="tabs">
             <button type="button" className={pestana === 'comunas' ? 'active' : ''} onClick={() => { setPestana('comunas'); setArchivo(null); setArchivoOficial(null); setComunaManual(''); setLogs([]); setDatosResultado([]); }}>Comunas</button>
             <button type="button" className={pestana === 'famosos' ? 'active' : ''} onClick={() => { setPestana('famosos'); setArchivo(null); setLogs([]); setDatosResultado([]); }}>Famosos</button>
-            <button type="button" className={pestana === 'lugares' ? 'active' : ''} onClick={() => { setPestana('lugares'); setArchivo(null); setLogs([]); setDatosResultado([]); }}>Lugares</button>
+            <button type="button" className={pestana === 'lugares' ? 'active' : ''} onClick={() => { setPestana('lugares'); setArchivo(null); }}>Lugares</button>
           </div>
 
           {pestana === 'comunas' && (
@@ -283,6 +437,16 @@ export default function App() {
             <button type="submit" className="btn btn-primary" disabled={cargando || !archivo}>
               {cargando ? 'Procesando Pipeline...' : 'Ejecutar Pipeline ETL'}
             </button>
+            {pestana === 'lugares' && (
+              <button
+                type="button"
+                className="btn btn-secondary"
+                onClick={cargarTodosLosLugares}
+                disabled={cargando}
+              >
+                Cargar Todos los Lugares Históricos
+              </button>
+            )}
           </form>
 
           {datosResultado.length > 0 && (
@@ -312,7 +476,148 @@ export default function App() {
           <div className="card">
             <h3>🗄️ Vista Previa Base de Datos (Postgres)</h3>
             <div className="table-container">
-              {datosResultado.length === 0 ? (
+              {pestana === 'lugares' ? (
+                /* Módulo de Lugares: mapa siempre visible aunque no haya datos aún */
+                <div style={{ display: 'block', width: '100%', marginTop: '10px' }}>
+                  {cargandoLugares && (
+                    <p style={{ color: '#93c5fd', fontSize: '13px', margin: '0 0 10px 0' }}>
+                      Cargando lugares históricos desde {API_BASE}...
+                    </p>
+                  )}
+                  {errorLugares && !cargandoLugares && (
+                    <p style={{ color: '#f87171', fontSize: '13px', margin: '0 0 10px 0', lineHeight: 1.4 }}>
+                      {errorLugares} Puedes subir un archivo .txt o pulsar «Cargar Todos los Lugares Históricos».
+                    </p>
+                  )}
+                  <div style={{ display: 'flex', gap: '10px', marginBottom: '10px', alignItems: 'center', flexWrap: 'wrap' }}>
+                    <div style={{ padding: '8px 10px', borderRadius: '6px', backgroundColor: '#1f2937', border: '1px solid #374151', color: '#d1d5db', fontSize: '12px' }}>
+                      Total cargados: <strong>{datosResultado.length}</strong>
+                    </div>
+                    <div style={{ padding: '8px 10px', borderRadius: '6px', backgroundColor: '#1f2937', border: '1px solid #374151', color: '#d1d5db', fontSize: '12px' }}>
+                      Con coordenadas: <strong>{lugaresConCoordenadas.length}</strong>
+                    </div>
+                    <input
+                      type="text"
+                      value={busquedaLugar}
+                      onChange={(e) => setBusquedaLugar(e.target.value)}
+                      placeholder="Buscar por lugar, calle, ciudad o país..."
+                      style={{ flex: 1, minWidth: '240px', padding: '8px', borderRadius: '6px', border: '1px solid #4b5563', backgroundColor: '#111827', color: 'white' }}
+                    />
+                  </div>
+
+                  <div style={{
+                    height: '450px',
+                    width: '100%',
+                    borderRadius: '8px',
+                    overflow: 'hidden',
+                    border: '2px solid #3b82f6',
+                    marginBottom: '20px',
+                    position: 'relative',
+                    backgroundColor: '#1f2937'
+                  }}>
+                    <MapContainer
+                      key="mapa-lugares-global"
+                      center={[-15, -60]}
+                      zoom={2}
+                      style={{ height: '450px', width: '100%' }}
+                      scrollWheelZoom
+                    >
+                      <TileLayer
+                        url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+                        attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
+                      />
+                      <CambiarCentroMapa centro={centroMapa} />
+                      <AjustarVistaMapa puntos={lugaresEnMapa} activar={ajustarVistaMapa} />
+                      {lugaresEnMapa.map((l) => (
+                          <Marker position={[l.lat, l.lon]} key={l.id ?? `${l.nombre_lugar}-${l.lat}-${l.lon}`}>
+                            <Popup>
+                              <div style={{ color: '#111827' }}>
+                                <strong style={{ fontSize: '14px' }}>{l.nombre_lugar}</strong><br />
+                                <span style={{ fontSize: '12px', color: '#4b5563' }}>
+                                  {l.direccion?.nombre_calle || 'Sin calle'} {l.direccion?.numero_calle || ''}
+                                </span>
+                                <div style={{ marginTop: '8px', display: 'flex', gap: '6px' }}>
+                                  <button
+                                    type="button"
+                                    style={{ border: 'none', borderRadius: '4px', backgroundColor: '#10b981', color: '#ffffff', fontSize: '11px', padding: '4px 8px', cursor: 'pointer' }}
+                                    onClick={() => irAlLugar(l)}
+                                  >
+                                    Viajar
+                                  </button>
+                                  <button
+                                    type="button"
+                                    style={{ border: 'none', borderRadius: '4px', backgroundColor: '#2563eb', color: '#ffffff', fontSize: '11px', padding: '4px 8px', cursor: 'pointer' }}
+                                    onClick={() => abrirRutaExterna(l)}
+                                  >
+                                    Como llegar
+                                  </button>
+                                </div>
+                              </div>
+                            </Popup>
+                          </Marker>
+                      ))}
+                    </MapContainer>
+                  </div>
+
+                  <div className="table-container">
+                    {datosResultado.length === 0 ? (
+                      <p style={{ padding: '20px', color: '#9ca3af', fontStyle: 'italic', textAlign: 'center' }}>
+                        Aún no hay lugares en memoria. Sube un dataset o espera la carga desde el servidor.
+                      </p>
+                    ) : (
+                    <table>
+                      <thead>
+                        <tr>
+                          <th>Lugar (Tabla 1)</th>
+                          <th>Dirección (Tabla 2)</th>
+                          <th>Coordenadas (Tabla 3)</th>
+                          <th>Acción</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {lugaresFiltrados.map((l, i) => {
+                          const coords = extraerCoordenadas(l.georeferencia);
+                          return (
+                          <tr key={l.id ?? i} style={{ backgroundColor: lugarSeleccionadoId === l.id ? '#1e3a8a' : 'transparent' }}>
+                            <td style={{color: 'white', fontWeight: 'bold'}}>{l.nombre_lugar}</td>
+                            <td>
+                              {l.direccion?.nombre_calle} {l.direccion?.numero_calle}
+                              <small style={{display: 'block', color: '#6b7280'}}>{l.direccion?.ciudad_estado_provincia}, {l.direccion?.pais}</small>
+                            </td>
+                            <td style={{color: '#3b82f6', fontFamily: 'monospace'}}>
+                              {coords ? `${coords.lat}, ${coords.lon}` : 'N/A'}
+                            </td>
+                            <td>
+                              <div style={{ display: 'flex', gap: '6px' }}>
+                                {coords && (
+                                  <button
+                                    type="button"
+                                    className="btn"
+                                    style={{ padding: '4px 10px', fontSize: '11px', backgroundColor: '#10b981', margin: 0 }}
+                                    onClick={() => irAlLugar(l)}
+                                  >
+                                    Viajar
+                                  </button>
+                                )}
+                                <button
+                                  type="button"
+                                  className="btn"
+                                  style={{ padding: '4px 10px', fontSize: '11px', backgroundColor: '#2563eb', margin: 0 }}
+                                  onClick={() => abrirRutaExterna(l)}
+                                >
+                                  Como llegar
+                                </button>
+                              </div>
+                            </td>
+                          </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                    )}
+                  </div>
+                </div>
+              ) : datosResultado.length === 0 ? (
                 <p style={{padding: '20px', color: '#4b5563', fontStyle: 'italic', textAlign: 'center'}}>No hay datos cargados en memoria.</p>
               ) : pestana === 'comunas' ? (
                 /* TABLA COMUNAS */
@@ -369,106 +674,7 @@ export default function App() {
                     ))}
                   </tbody>
                 </table>
-              ) : (
-                /* Módulo de Lugares con Forzado de Redibujado */
-                <div style={{ display: 'block', width: '100%', marginTop: '10px' }}>
-                  
-                  {/* EL MAPA MUNDIAL DE LEAFLET */}
-                  <div style={{ 
-                    height: '450px', 
-                    width: '100%', 
-                    borderRadius: '8px', 
-                    overflow: 'hidden', 
-                    border: '2px solid #3b82f6', 
-                    marginBottom: '20px',
-                    position: 'relative', // Evita que Leaflet flote fuera de su tarjeta
-                    backgroundColor: '#1f2937' // Fondo gris oscuro para que no se vea blanco mientras carga
-                  }}>
-                    <MapContainer 
-                      center={[-36.827, -73.050]} 
-                      zoom={2} 
-                      style={{ height: '450px', width: '100%' }} // Altura estática forzada en píxeles
-                      whenReady={(mapInstance) => {
-                        // Fuerza al mapa a recalcular sus dimensiones en el primer segundo
-                        setTimeout(() => {
-                          mapInstance.target.invalidateSize();
-                        }, 200);
-                      }}
-                    >
-                      <TileLayer 
-                        url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
-                        attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
-                      />
-                      
-                      {/* Animador de cámara dinámico */}
-                      <CambiarCentroMapa centro={centroMapa} />
-                      
-                      {/* Filtro ultra seguro para marcadores */}
-                      {pestana === 'lugares' && datosResultado && datosResultado.map((l, i) => {
-                        const tieneCoordenadas = l?.georeferencia && 
-                                                 typeof l.georeferencia.latitud === 'number' && 
-                                                 typeof l.georeferencia.longitud === 'number';
-                        
-                        if (tieneCoordenadas) {
-                          return (
-                            <Marker position={[l.georeferencia.latitud, l.georeferencia.longitud]} key={i}>
-                              <Popup>
-                                <div style={{ color: '#111827' }}>
-                                  <strong style={{ fontSize: '14px' }}>{l.nombre_lugar}</strong><br />
-                                  <span style={{ fontSize: '12px', color: '#4b5563' }}>
-                                    {l.direccion?.nombre_calle || 'Sin calle'} {l.direccion?.numero_calle || ''}
-                                  </span>
-                                </div>
-                              </Popup>
-                            </Marker>
-                          );
-                        }
-                        return null;
-                      })}
-                    </MapContainer>
-                  </div>
-
-                  {/* TABLA RELACIONAL DE LUGARES */}
-                  <div className="table-container">
-                    <table>
-                      <thead>
-                        <tr>
-                          <th>Lugar (Tabla 1)</th>
-                          <th>Dirección (Tabla 2)</th>
-                          <th>Coordenadas (Tabla 3)</th>
-                          <th>Acción</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {datosResultado && datosResultado.map((l, i) => (
-                          <tr key={i}>
-                            <td style={{color: 'white', fontWeight: 'bold'}}>{l.nombre_lugar}</td>
-                            <td>
-                              {l.direccion?.nombre_calle} {l.direccion?.numero_calle}
-                              <small style={{display: 'block', color: '#6b7280'}}>{l.direccion?.ciudad_estado_provincia}, {l.direccion?.pais}</small>
-                            </td>
-                            <td style={{color: '#3b82f6', fontFamily: 'monospace'}}>
-                              {l.georeferencia?.latitud ? `${l.georeferencia.latitud}, ${l.georeferencia.longitud}` : 'N/A'}
-                            </td>
-                            <td>
-                              {l.georeferencia?.latitud && (
-                                <button
-                                  type="button"
-                                  className="btn"
-                                  style={{ padding: '4px 10px', fontSize: '11px', backgroundColor: '#10b981', margin: 0 }}
-                                  onClick={() => setCentroMapa([l.georeferencia.latitud, l.georeferencia.longitud])}
-                                >
-                                  Viajar
-                                </button>
-                              )}
-                            </td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
-                </div>
-              )}
+              ) : null}
             </div>
           </div>
         </div>
