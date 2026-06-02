@@ -1,13 +1,28 @@
+# ==========================================
 # Django (Backend)
+# ==========================================
 *.sqlite3
-limpia_datasets/db.sqlite3
+db.sqlite3
 __pycache__/
 *.pyc
 .env
 v_env/
 env/
+venv/
 
-# React (Frontend)
-cliente-etl/node_modules/
-cliente-etl/dist/
+# ==========================================
+# React / Node (Frontend)
+# ==========================================
+# Esto intercepta node_modules y dist en cualquier carpeta del proyecto
+**/node_modules/
+**/dist/
+node_modules/
+dist/
+
+# ==========================================
+# Sistema Operativo / IDEs
+# ==========================================
 .DS_Store
+Thumbs.db
+.vscode/
+.idea/
