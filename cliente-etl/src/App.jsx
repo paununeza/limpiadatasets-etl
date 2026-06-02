@@ -396,10 +396,10 @@ const ejecutarETL = async (e, esManual = false) => {
       {/* Datos del Famoso */}
       <h3 style={{ margin: '0 0 5px 0', color: 'white' }}>{famosoSeleccionado.nombre}</h3>
       <p style={{ fontSize: '12px', color: '#9ca3af', margin: '0 0 15px 0' }}>
-        Nacimiento original: {famosoSeleccionado.fecha_nacimiento_original} | Edad: {famosoSeleccionado.edad} años
+        Nacimiento original: {famosoSeleccionado.fecha_nacimiento_chile} | Edad: {famosoSeleccionado.edad} años
       </p>
       
-      {/* Contenedor de Imagen Bien Escalada */}
+      {/* Contenedor de Imagen Escalada */}
       <div style={{ 
         width: '100%', 
         height: '320px', 
@@ -417,12 +417,12 @@ const ejecutarETL = async (e, esManual = false) => {
           <img 
             src={urlImagenFamoso} 
             alt={famosoSeleccionado.nombre} 
-            style={{ width: '100%', height: '100%', objectFit: 'contain' }} // 'contain' asegura que la imagen se escale perfecta sin deformarse ni recortarse
+            style={{ width: '100%', height: '100%', objectFit: 'contain' }} // 'contain' asegura que la imagen se escale sin deformar ni recortarse
           />
         )}
       </div>
       
-      {/* Ficha Técnica Requerida por la Pauta */}
+      {/* Ficha Técnica */}
       <div style={{ marginTop: '15px', padding: '10px', backgroundColor: '#1f2937', borderRadius: '4px', textAlign: 'left', fontSize: '11px', lineHeight: '1.4' }}>
         <div style={{ marginBottom: '4px' }}>
           <strong style={{ color: '#10b981' }}>Fuente de la imagen:</strong> 
