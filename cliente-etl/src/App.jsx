@@ -354,7 +354,7 @@ export default function App() {
                         <td style={{color: 'white', fontWeight: 'bold'}}>{f.nombre}</td>
                         <td>{f.fecha_nacimiento_chile}</td>
                         <td style={{color: '#10b981', fontWeight: 'bold'}}>{f.edad}</td>
-                        <td>{f.es_cumpleanos ? '🎉 SÍ' : 'NO'}</td>
+                        <td>{f.es_cumpleanos ? '🎉SÍ' : 'NO'}</td>
                         <td>
                           <button 
                             type="button" 
@@ -370,7 +370,7 @@ export default function App() {
                   </tbody>
                 </table>
               ) : (
-                /* Renderizado de Módulo de Lugares Estructurado Relacionalmente */
+                /* Renderizado de Módulo de Lugares */
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
                   
                   {/* EL MAPA MUNDIAL DE LEAFLET */}
@@ -438,7 +438,7 @@ export default function App() {
                                 style={{ padding: '4px 10px', fontSize: '11px', backgroundColor: '#10b981', margin: 0 }}
                                 onClick={() => setCentroMapa([l.georeferencia.latitud, l.georeferencia.longitud])}
                               >
-                                🎯 Viajar
+                                Viajar
                               </button>
                             )}
                           </td>
