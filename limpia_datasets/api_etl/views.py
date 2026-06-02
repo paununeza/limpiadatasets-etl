@@ -77,6 +77,10 @@ class ProcesarFamososView(APIView):
 
         logs.append(f"=== ETL FAMOSOS INICIADO - TIMESTAMP UNIX: {int(time.time())} ===")
 
+        # Guarda la combinación única (Nombre + Fecha Original) 
+        # procesada en esta corrida para eliminar duplicados de texto exactos
+        registros_procesados_corrida = set()
+
         for idx, linea in enumerate(archivo, start=1):
             linea_str = decodificar_linea(linea)
             
@@ -95,6 +99,17 @@ class ProcesarFamososView(APIView):
             
             nombre_final, corregido_fuzz = buscar_fuzz(limpiar_texto_basico(nombre_raw), lista_oficial)
             
+            # Creamos una llave compuesta única basada en el Nombre Limpio y su Fecha Original
+            llave_registro = (nombre_final, fecha_raw.lower().strip())
+
+            # ELIMINACIÓN DE DUPLICADOS REALES:
+            if llave_registro in registros_procesados_corrida:
+                logs.append(f"[{datetime.now().strftime('%X')}][LÍNEA {idx}] ELIMINADO: Registro idéntico duplicado para '{nombre_final}' con fecha '{fecha_raw}'.")
+                continue # Se salta el duplicado exacto
+                
+            # Si no está repetido exactamente el bloque, es un registro válido (o un homónimo legítimo)
+            registros_procesados_corrida.add(llave_registro)
+
             if corregido_fuzz:
                 logs.append(f"[{datetime.now().strftime('%X')}][LÍNEA {idx}] FUZZ CORRECCIÓN: '{nombre_raw}' -> '{nombre_final}'")
 
@@ -113,12 +128,8 @@ class ProcesarFamososView(APIView):
                     logs.append(f"[{datetime.now().strftime('%X')}][LÍNEA {idx}] Error en año a.C. Omitido.")
                     continue
             else:
-                # Usa parser inteligente forzando Día primero
                 try:
-                    # Sustituir guiones por diagonales para homogeneizar o viceversa
                     fecha_normalizada = fecha_raw.replace('/', '-')
-                    
-                    # Forzar dayfirst=True
                     dt_nacimiento = parser.parse(fecha_normalizada, dayfirst=True)
                     
                     fecha_chile = dt_nacimiento.strftime("%d-%m-%Y")
@@ -126,7 +137,6 @@ class ProcesarFamososView(APIView):
                     es_cumpleanos = (mes_actual == dt_nacimiento.month and dia_actual == dt_nacimiento.day)
                     
                 except (ValueError, TypeError):
-                    # Si no es una fecha estructurada completa, extrae el año libre
                     match_anho = re.search(r'\b\d{3,4}\b', fecha_raw)
                     if match_anho:
                         anho_extraido = int(match_anho.group())
@@ -138,7 +148,7 @@ class ProcesarFamososView(APIView):
                         logs.append(f"[{datetime.now().strftime('%X')}][LÍNEA {idx}] Imposible parsear fecha '{fecha_raw}'. Omitido.")
                         continue
 
-            # Guarda directo en la BD permitiendo duplicados legítimos de nombres
+            # Inserción limpia en Neon Postgres (Soporta homónimos gracias al ID autoincremental)
             famoso_obj = Famoso.objects.create(
                 nombre=nombre_final,
                 fecha_nacimiento_original=fecha_raw,
