@@ -11,8 +11,10 @@ export default function App() {
   const [ordenar, setOrdenar] = useState(true);
   const [sensibilidad, setSensibilidad] = useState(0.70); // Control de umbral Fuzz
 
+  const [famosoSeleccionado, setFamosoSeleccionado] = useState(null); // Guardaremos el objeto completo
   const [urlImagenFamoso, setUrlImagenFamoso] = useState(null);
-  const [famosoSeleccionado, setFamosoSeleccionado] = useState('');
+  const [fuenteImagen, setFuenteImagen] = useState('');
+  const [fechaCaptura, setFechaCaptura] = useState('');
   const [buscandoFoto, setBuscandoFoto] = useState(false);
 
   const [logs, setLogs] = useState([]);
@@ -126,34 +128,61 @@ const ejecutarETL = async (e, esManual = false) => {
 
   };
 
-  const verImagenFamoso = async (nombreFamoso) => {
-  setBuscandoFoto(true);
-  setFamosoSeleccionado(nombreFamoso);
-  setUrlImagenFamoso(null);
+  const verImagenFamoso = async (famosoObj) => {
+    setBuscandoFoto(true);
+    setFamosoSeleccionado(famosoObj);
+    setUrlImagenFamoso(null);
+    setFuenteImagen('');
+    setFechaCaptura('');
 
-  // Endpoint público de la API de Wikipedia para obtener imágenes miniatura (Pageimages)
-  const urlApi = `https://es.wikipedia.org/w/api.php?action=query&titles=${encodeURIComponent(nombreFamoso)}&prop=pageimages&format=json&pithumbsize=400&origin=*`;
-
-  try {
-    const respuesta = await axios.get(urlApi);
-    const paginas = respuesta.data.query.pages;
-    const pageId = Object.keys(paginas)[0];
-    
-    if (pageId !== "-1" && paginas[pageId].thumbnail) {
-      // Encontrar la foto oficial
-      setUrlImagenFamoso(paginas[pageId].thumbnail.source);
-    } else {
-      // Imagen de respaldo si el famoso no tiene foto en su artículo
-      setUrlImagenFamoso('https://via.placeholder.com/400x400.png?text=Sin+Imagen+Oficial');
+    // ESTRATEGIA DE CACHÉ: Si ya existen los datos en BD, los usamos de inmediato
+    if (famosoObj.imagen_url) {
+      setUrlImagenFamoso(famosoObj.imagen_url);
+      setFuenteImagen(famosoObj.imagen_fuente || 'Wikimedia Commons (BD Local)');
+      setFechaCaptura(famosoObj.imagen_captura_fecha || 'No especificada (BD Local)');
+      setBuscandoFoto(false);
+      return; // Fin del flujo, ahorramos una consulta a la API externa
     }
-  } catch (error) {
-    console.error("Error al buscar la imagen:", error);
-    setUrlImagenFamoso('https://via.placeholder.com/400x400.png?text=Error+de+Conexi%C3%B3n');
-  } finally {
-    setBuscandoFoto(false);
-  }
-};
 
+    // Si no existen, le pegamos a Wikipedia (Paso fallback síncrono)
+    const nombreFamoso = famosoObj.nombre;
+    const urlApi = `https://es.wikipedia.org/w/api.php?action=query&titles=${encodeURIComponent(nombreFamoso)}&prop=pageimages|imageinfo&iiprop=timestamp|url&format=json&pithumbsize=400&origin=*`;
+
+    try {
+      const respuesta = await axios.get(urlApi);
+      const paginas = respuesta.data.query.pages;
+      const pageId = Object.keys(paginas)[0];
+      
+      let imgUrl = 'https://via.placeholder.com/400x400.png?text=Sin+Imagen+Oficial';
+      let imgFuente = `https://es.wikipedia.org/wiki/${encodeURIComponent(nombreFamoso)}`;
+      let imgFecha = new Date().toLocaleDateString('es-CL'); // Fecha de captura de la API el día de hoy
+
+      if (pageId !== "-1" && paginas[pageId].thumbnail) {
+        imgUrl = paginas[pageId].thumbnail.source;
+        imgFuente = `Wikimedia Commons / Wikipedia Article: id ${pageId}`;
+      }
+
+      setUrlImagenFamoso(imgUrl);
+      setFuenteImagen(imgFuente);
+      setFechaCaptura(imgFecha);
+
+      // PERSISTENCIA EN NEON: Guardamos dentro de Postgres para futuras consultas
+      await axios.post('https://limpiadatasets-etl.onrender.com/api/etl/famosos/guardar-imagen/', {
+        id: famosoObj.id,
+        imagen_url: imgUrl,
+        imagen_fuente: imgFuente,
+        imagen_captura_fecha: imgFecha
+      });
+
+    } catch (error) {
+      console.error("Error al buscar u optimizar imagen:", error);
+      setUrlImagenFamoso('https://via.placeholder.com/400x400.png?text=Error+de+Conexi%C3%B3n');
+      setFuenteImagen('Desconocida');
+      setFechaCaptura('N/A');
+    } finally {
+      setBuscandoFoto(false);
+    }
+  };
 
   return (
     <div>
@@ -320,7 +349,7 @@ const ejecutarETL = async (e, esManual = false) => {
                             type="button" 
                             className="btn"
                             style={{ padding: '4px 10px', fontSize: '11px', backgroundColor: '#3b82f6', margin: 0 }}
-                            onClick={() => verImagenFamoso(f.nombre)}
+                            onClick={() => verImagenFamoso(f)}
                           >
                             Ver Imagen
                           </button>
@@ -358,37 +387,64 @@ const ejecutarETL = async (e, esManual = false) => {
         </div>
 
         {famosoSeleccionado && (
-          <div style={{
-            position: 'fixed', top: 0, left: 0, width: '100%', height: '100%',
-            backgroundColor: 'rgba(0,0,0,0.8)', display: 'flex', justifyContent: 'center', alignItems: 'center', zIndex: 9999
-          }}>
-            <div className="card" style={{ maxWidth: '420px', width: '90%', textAlign: 'center', border: '3px solid #3b82f6', backgroundColor: '#111827' }}>
-              <h3 style={{ margin: '0 0 15px 0', color: 'white' }}>{famosoSeleccionado}</h3>
-              
-              {buscandoFoto ? (
-                <div style={{ height: '300px', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#9ca3af' }}>
-                  🔍 Buscando archivo en Wikimedia...
-                </div>
-              ) : (
-                <img 
-                  src={urlImagenFamoso} 
-                  alt={famosoSeleccionado} 
-                  style={{ width: '100%', height: '300px', objectFit: 'cover', borderRadius: '4px', border: '2px solid #4b5563' }}
-                />
-              )}
-              
-              <button 
-                type="button" 
-                className="btn btn-secondary" 
-                style={{ marginTop: '15px', width: '100%' }}
-                onClick={() => { setFamosoSeleccionado(''); setUrlImagenFamoso(null); }}
-              >
-                Cerrar Visor
-              </button>
-            </div>
-          </div>
+  <div style={{
+    position: 'fixed', top: 0, left: 0, width: '100%', height: '100%',
+    backgroundColor: 'rgba(0,0,0,0.85)', display: 'flex', justifyContent: 'center', alignItems: 'center', zIndex: 9999
+  }}>
+    <div className="card" style={{ maxWidth: '450px', width: '90%', textAlign: 'center', border: '3px solid #10b981', backgroundColor: '#111827', padding: '20px' }}>
+      
+      {/* Datos del Famoso */}
+      <h3 style={{ margin: '0 0 5px 0', color: 'white' }}>{famosoSeleccionado.nombre}</h3>
+      <p style={{ fontSize: '12px', color: '#9ca3af', margin: '0 0 15px 0' }}>
+        Nacimiento original: {famosoSeleccionado.fecha_nacimiento_original} | Edad: {famosoSeleccionado.edad} años
+      </p>
+      
+      {/* Contenedor de Imagen Bien Escalada */}
+      <div style={{ 
+        width: '100%', 
+        height: '320px', 
+        backgroundColor: '#1f2937', 
+        borderRadius: '6px', 
+        overflow: 'hidden', 
+        border: '2px solid #4b5563',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center'
+      }}>
+        {buscandoFoto ? (
+          <span style={{ color: '#9ca3af', fontSize: '14px' }}>Conectando con la fuente de datos...</span>
+        ) : (
+          <img 
+            src={urlImagenFamoso} 
+            alt={famosoSeleccionado.nombre} 
+            style={{ width: '100%', height: '100%', objectFit: 'contain' }} // 'contain' asegura que la imagen se escale perfecta sin deformarse ni recortarse
+          />
         )}
-
+      </div>
+      
+      {/* Ficha Técnica Requerida por la Pauta */}
+      <div style={{ marginTop: '15px', padding: '10px', backgroundColor: '#1f2937', borderRadius: '4px', textAlign: 'left', fontSize: '11px', lineHeight: '1.4' }}>
+        <div style={{ marginBottom: '4px' }}>
+          <strong style={{ color: '#10b981' }}>Fuente de la imagen:</strong> 
+          <span style={{ color: '#d1d5db', marginLeft: '5px', wordBreak: 'break-all' }}>{fuenteImagen}</span>
+        </div>
+        <div>
+          <strong style={{ color: '#10b981' }}>Fecha de captura API:</strong> 
+          <span style={{ color: '#d1d5db', marginLeft: '5px' }}>{fechaCaptura}</span>
+        </div>
+      </div>
+      
+      <button 
+        type="button" 
+        className="btn btn-secondary" 
+        style={{ marginTop: '15px', width: '100%', backgroundColor: '#ef4444' }}
+        onClick={() => { setFamosoSeleccionado(null); setUrlImagenFamoso(null); }}
+      >
+        Cerrar Ficha
+      </button>
+    </div>
+  </div>
+)}
 
       </main>
     </div>

@@ -178,6 +178,25 @@ class ProcesarFamososView(APIView):
 
         serializer = FamosoSerializer(famosos_a_retornar, many=True)
         return Response({"logs": logs, "data": serializer.data})
+    
+
+# Guarda los metadatos de la imagen recuperada para caché persistente
+class GuardarImagenFamosoView(APIView):
+    def post(self, request):
+        famoso_id = request.data.get('id')
+        url = request.data.get('imagen_url')
+        fuente = request.data.get('imagen_fuente')
+        fecha = request.data.get('imagen_captura_fecha')
+        
+        try:
+            famoso = Famoso.objects.get(id=famoso_id)
+            famoso.imagen_url = url
+            famoso.imagen_fuente = fuente
+            famoso.imagen_captura_fecha = fecha
+            famoso.save()
+            return Response({"status": "Imagen cacheada con éxito"}, status=200)
+        except Famoso.DoesNotExist:
+            return Response({"error": "Famoso no encontrado"}, status=404)
 
 # =====================================================================
 # PROCESADOR DE LUGARES
