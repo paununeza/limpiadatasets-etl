@@ -80,8 +80,15 @@ class ProcesarFamososView(APIView):
         logs.append(f"=== ETL FAMOSOS INICIADO - TIMESTAMP UNIX: {int(time.time())} ===")
 
 
-        # Set de control local exclusivo para eliminar los duplicados internos del archivo actual
+       # Sets de control histórico y de sesión para descarte absoluto
+        registros_en_bd = set()
         duplicados_archivo_set = set()
+
+        # Cargamos el historial de la base de datos limpiando retornos de carro
+        famosos_en_base_datos = Famoso.objects.values_list('nombre', 'fecha_nacimiento_original')
+        for nom, fec_orig in famosos_en_base_datos:
+            fec_limpia_bd = fec_orig.replace('\r', '').replace('\n', '').strip().lower()
+            registros_en_bd.add((nom, fec_limpia_bd))
 
         for idx, linea in enumerate(archivo, start=1):
             linea_str = decodificar_linea(linea)
@@ -97,11 +104,13 @@ class ProcesarFamososView(APIView):
 
             partes_famoso = linea_limpia.split(" - ", 1)
             nombre_raw = partes_famoso[0].strip()
-            fecha_raw = partes_famoso[1].strip()
+
+            # Eliminamos saltos de línea ocultos (\r, \n) de raíz
+            fecha_raw = partes_famoso[1].replace('\r', '').replace('\n', '').strip()
             
             nombre_final, corregido_fuzz = buscar_fuzz(limpiar_texto_basico(nombre_raw), lista_oficial)
             
-            llave_registro = (nombre_final, fecha_raw.lower().strip())
+            llave_registro = (nombre_final, fecha_raw.lower())
 
             # 1. DETECCION DE DUPLICADOS EN EL ARCHIVO: Si viene repetido en el txt, se destruye al instante
             if llave_registro in duplicados_archivo_set:
@@ -117,10 +126,10 @@ class ProcesarFamososView(APIView):
             # Buscamos si exactamente este personaje con esta fecha ya se guardó en el pasado
             registro_existente = Famoso.objects.filter(nombre=nombre_final, fecha_nacimiento_original=fecha_raw).first()
             
-            if registro_existente:
+            if llave_registro in registros_en_bd or registro_existente:
                 logs.append(f"[{datetime.now().strftime('%X')}][LÍNEA {idx}] PERSISTENCIA: '{nombre_final}' ya existe en Postgres. Cargando registro histórico.")
-                # Recuperamos el objeto viejo y lo metemos a la lista de salida de la sesión (sin duplicar en Neon)
-                famosos_a_retornar.append(registro_existente)
+                if registro_existente and registro_existente not in famosos_a_retornar:
+                    famosos_a_retornar.append(registro_existente)
                 continue
 
             # Si es 100% nuevo en la historia de la app, calculamos sus métricas de edad
@@ -137,6 +146,7 @@ class ProcesarFamososView(APIView):
                     es_cumpleanos = (mes_actual == 1 and dia_actual == 1)
                 except Exception:
                     logs.append(f"[{datetime.now().strftime('%X')}][LÍNEA {idx}] Error en año a.C. Omitido.")
+                    duplicados_archivo_set.remove(llave_registro)
                     continue
             else:
                 try:
@@ -157,9 +167,10 @@ class ProcesarFamososView(APIView):
                         logs.append(f"[{datetime.now().strftime('%X')}][LÍNEA {idx}] PARSEO REPARADO: Se infirió el año '{anho_extraido}' de '{fecha_raw}'.")
                     else:
                         logs.append(f"[{datetime.now().strftime('%X')}][LÍNEA {idx}] Imposible parsear fecha '{fecha_raw}'. Omitido.")
+                        duplicados_archivo_set.remove(llave_registro)
                         continue
 
-            # Inserción controlada única
+            # Inserción única y limpia
             famoso_obj = Famoso.objects.create(
                 nombre=nombre_final,
                 fecha_nacimiento_original=fecha_raw,
