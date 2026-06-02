@@ -77,9 +77,13 @@ class ProcesarFamososView(APIView):
 
         logs.append(f"=== ETL FAMOSOS INICIADO - TIMESTAMP UNIX: {int(time.time())} ===")
 
-        # Guarda la combinación única (Nombre + Fecha Original) 
-        # procesada en esta corrida para eliminar duplicados de texto exactos
+        # Inicializamos el set de control cargando lo que YA existe en Neon Postgres
+        # Almacenamos la tupla (nombre, fecha_original_en_minuscula) de ejecuciones pasadas
         registros_procesados_corrida = set()
+        
+        famosos_en_base_datos = Famoso.objects.values_list('nombre', 'fecha_nacimiento_original')
+        for nom, fec_orig in famosos_en_base_datos:
+            registros_procesados_corrida.add((nom, fec_orig.lower().strip()))
 
         for idx, linea in enumerate(archivo, start=1):
             linea_str = decodificar_linea(linea)
@@ -126,6 +130,7 @@ class ProcesarFamososView(APIView):
                     es_cumpleanos = (mes_actual == 1 and dia_actual == 1)
                 except Exception:
                     logs.append(f"[{datetime.now().strftime('%X')}][LÍNEA {idx}] Error en año a.C. Omitido.")
+                    registros_procesados_corrida.remove(llave_registro)
                     continue
             else:
                 try:
@@ -146,9 +151,10 @@ class ProcesarFamososView(APIView):
                         logs.append(f"[{datetime.now().strftime('%X')}][LÍNEA {idx}] PARSEO REPARADO: Se infirió el año '{anho_extraido}' de '{fecha_raw}'.")
                     else:
                         logs.append(f"[{datetime.now().strftime('%X')}][LÍNEA {idx}] Imposible parsear fecha '{fecha_raw}'. Omitido.")
+                        registros_procesados_corrida.remove(llave_registro)
                         continue
 
-            # Inserción limpia en Neon Postgres (Soporta homónimos gracias al ID autoincremental)
+            # Inserción limpia en BD
             famoso_obj = Famoso.objects.create(
                 nombre=nombre_final,
                 fecha_nacimiento_original=fecha_raw,
