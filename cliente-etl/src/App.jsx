@@ -370,12 +370,31 @@ export default function App() {
                   </tbody>
                 </table>
               ) : (
-                /* Renderizado de Módulo de Lugares */
-                <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
+                /* Módulo de Lugares con Forzado de Redibujado */
+                <div style={{ display: 'block', width: '100%', marginTop: '10px' }}>
                   
                   {/* EL MAPA MUNDIAL DE LEAFLET */}
-                  <div style={{ height: '400px', width: '100%', borderRadius: '8px', overflow: 'hidden', border: '2px solid #3b82f6' }}>
-                    <MapContainer center={[-36.827, -73.050]} zoom={2} style={{ height: '100%', width: '100%' }}>
+                  <div style={{ 
+                    height: '450px', 
+                    width: '100%', 
+                    borderRadius: '8px', 
+                    overflow: 'hidden', 
+                    border: '2px solid #3b82f6', 
+                    marginBottom: '20px',
+                    position: 'relative', // Evita que Leaflet flote fuera de su tarjeta
+                    backgroundColor: '#1f2937' // Fondo gris oscuro para que no se vea blanco mientras carga
+                  }}>
+                    <MapContainer 
+                      center={[-36.827, -73.050]} 
+                      zoom={2} 
+                      style={{ height: '450px', width: '100%' }} // Altura estática forzada en píxeles
+                      whenReady={(mapInstance) => {
+                        // Fuerza al mapa a recalcular sus dimensiones en el primer segundo
+                        setTimeout(() => {
+                          mapInstance.target.invalidateSize();
+                        }, 200);
+                      }}
+                    >
                       <TileLayer 
                         url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
                         attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
@@ -384,9 +403,8 @@ export default function App() {
                       {/* Animador de cámara dinámico */}
                       <CambiarCentroMapa centro={centroMapa} />
                       
-                      {/* Solo mapeamos si estamos en la pestaña correcta y hay datos válidos */}
+                      {/* Filtro ultra seguro para marcadores */}
                       {pestana === 'lugares' && datosResultado && datosResultado.map((l, i) => {
-                        // Verificamos de forma estricta que existan las coordenadas numéricas
                         const tieneCoordenadas = l?.georeferencia && 
                                                  typeof l.georeferencia.latitud === 'number' && 
                                                  typeof l.georeferencia.longitud === 'number';
@@ -409,43 +427,46 @@ export default function App() {
                       })}
                     </MapContainer>
                   </div>
+
                   {/* TABLA RELACIONAL DE LUGARES */}
-                  <table>
-                    <thead>
-                      <tr>
-                        <th>Lugar (Tabla 1)</th>
-                        <th>Dirección (Tabla 2)</th>
-                        <th>Coordenadas (Tabla 3)</th>
-                        <th>Acción</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {datosResultado.map((l, i) => (
-                        <tr key={i}>
-                          <td style={{color: 'white', fontWeight: 'bold'}}>{l.nombre_lugar}</td>
-                          <td>
-                            {l.direccion?.nombre_calle} {l.direccion?.numero_calle}
-                            <small style={{display: 'block', color: '#6b7280'}}>{l.direccion?.ciudad_estado_provincia}, {l.direccion?.pais}</small>
-                          </td>
-                          <td style={{color: '#3b82f6', fontFamily: 'monospace'}}>
-                            {l.georeferencia?.latitud ? `${l.georeferencia.latitud}, ${l.georeferencia.longitud}` : 'N/A'}
-                          </td>
-                          <td>
-                            {l.georeferencia?.latitud && (
-                              <button
-                                type="button"
-                                className="btn"
-                                style={{ padding: '4px 10px', fontSize: '11px', backgroundColor: '#10b981', margin: 0 }}
-                                onClick={() => setCentroMapa([l.georeferencia.latitud, l.georeferencia.longitud])}
-                              >
-                                Viajar
-                              </button>
-                            )}
-                          </td>
+                  <div className="table-container">
+                    <table>
+                      <thead>
+                        <tr>
+                          <th>Lugar (Tabla 1)</th>
+                          <th>Dirección (Tabla 2)</th>
+                          <th>Coordenadas (Tabla 3)</th>
+                          <th>Acción</th>
                         </tr>
-                      ))}
-                    </tbody>
-                  </table>
+                      </thead>
+                      <tbody>
+                        {datosResultado && datosResultado.map((l, i) => (
+                          <tr key={i}>
+                            <td style={{color: 'white', fontWeight: 'bold'}}>{l.nombre_lugar}</td>
+                            <td>
+                              {l.direccion?.nombre_calle} {l.direccion?.numero_calle}
+                              <small style={{display: 'block', color: '#6b7280'}}>{l.direccion?.ciudad_estado_provincia}, {l.direccion?.pais}</small>
+                            </td>
+                            <td style={{color: '#3b82f6', fontFamily: 'monospace'}}>
+                              {l.georeferencia?.latitud ? `${l.georeferencia.latitud}, ${l.georeferencia.longitud}` : 'N/A'}
+                            </td>
+                            <td>
+                              {l.georeferencia?.latitud && (
+                                <button
+                                  type="button"
+                                  className="btn"
+                                  style={{ padding: '4px 10px', fontSize: '11px', backgroundColor: '#10b981', margin: 0 }}
+                                  onClick={() => setCentroMapa([l.georeferencia.latitud, l.georeferencia.longitud])}
+                                >
+                                  Viajar
+                                </button>
+                              )}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
                 </div>
               )}
             </div>
