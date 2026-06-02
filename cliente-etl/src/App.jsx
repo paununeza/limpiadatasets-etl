@@ -1,17 +1,13 @@
 import React, { useState } from 'react';
 import axios from 'axios';
 
-// Importaciones de Leaflet para el Mapa del 50%
+// Importaciones de Leaflet para el Mapa
 import { MapContainer, TileLayer, Marker, Popup, useMap } from 'react-leaflet';
-import 'leaflet/dist/leaflet.css';
 import L from 'leaflet';
-
-// Parche obligatorio para que los íconos de Leaflet no salgan rotos en Vite/React
-import icon from 'leaflet/dist/images/marker-icon.png';
-import iconShadow from 'leaflet/dist/images/marker-shadow.png';
+// Configuración directa con URLs globales para que Vite no se confunda con las rutas
 let DefaultIcon = L.icon({
-    iconUrl: icon,
-    shadowUrl: iconShadow,
+    iconUrl: 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.7.1/images/marker-icon.png',
+    shadowUrl: 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.7.1/images/marker-shadow.png',
     iconSize: [25, 41],
     iconAnchor: [12, 41]
 });
