@@ -32,7 +32,10 @@ const ejecutarETL = async (e, esManual = false) => {
     if (!esManual && !archivo) return;
     if (esManual && !comunaManual.trim()) return;
 
+    setDatosResultado([]);
+    setLogs([]);
     setCargando(true);
+
     const formData = new FormData();
     formData.append('sensibilidad', sensibilidad);
     formData.append('formato', formato);
@@ -116,6 +119,11 @@ const ejecutarETL = async (e, esManual = false) => {
     link.href = url;
     link.setAttribute('download', nombreDescarga);
     link.click();
+
+    // PARCHE DE SEGURIDAD 2: Destruimos el objeto de la memoria del navegador
+    // Esto obliga a que la próxima descarga compile un archivo totalmente nuevo desde cero
+    URL.revokeObjectURL(url);
+
   };
 
   const verImagenFamoso = async (nombreFamoso) => {
