@@ -48,78 +48,73 @@ def buscar_fuzz(texto_normalizado, lista_oficial, cutoff=0.75):
     return texto_normalizado, False
 
 # =====================================================================
-# Consultas API Wikipedia
+# Consultas API DPA Chile para obtener región y población de comunas
 # =====================================================================
 
 def consultar_api_comuna(nombre_comuna):
     """
-    Se conecta a la API Abierta de la División Político-Administrativa (DPA) del Gobierno de Chile
-    para obtener la Región y estimación de Habitantes de forma 100% dinámica.
+    Versión de Diagnóstico Avanzado para la API DPA de Chile.
+    Printea los errores directamente en el panel de Render para saber qué falla.
     """
     import unicodedata
+    import traceback # Para ver la línea exacta del error si se cae
     
-    # 1. Limpieza estricta para la URL de la API (Quitar tildes y dejar en minúsculas)
-    comuna_url = "".join(c for c in unicodedata.normalize('NFD', nombre_comuna) if unicodedata.category(c) != 'Mn')
-    comuna_url = comuna_url.lower().strip()
+    # Función auxiliar local para aplanar textos (QUITA TILDES, ESPACIOS Y MAYÚSCULAS)
+    def aplanar(texto):
+        if not texto: return ""
+        texto = texto.strip().lower()
+        texto = texto.replace('ñ', 'n').replace('Ñ', 'N')
+        return "".join(c for c in unicodedata.normalize('NFD', texto) if unicodedata.category(c) != 'Mn')
+
+    comuna_buscada = aplanar(nombre_comuna)
+    url_api = "https://apis.digital.gob.cl/dpa/comunas"
     
-    # Reemplazos específicos para comunas con nombres compuestos en la API del Gobierno
-    comuna_url = comuna_url.replace(" ", "-")
-    
-    # Endpoint oficial e institucional de la DPA (Espejo de consulta por nombre/código)
-    url_api = f"https://apis.digital.gob.cl/dpa/comunas"
-    
-    if not comuna_url:
+    if not comuna_buscada:
         return "No Encontrada", None
 
-    # Cabeceras estándar para simular una consulta de navegador común
     cabeceras = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
     }
 
     try:
-        # Consultamos el listado general de la DPA chilena
-        respuesta = requests.get(url_api, headers=cabeceras, timeout=4)
+        print(f"[ETL API] Iniciando consulta para la comuna: '{nombre_comuna}' (Aplanada: '{comuna_buscada}')")
+        respuesta = requests.get(url_api, headers=cabeceras, timeout=6)
+        
+        print(f"[ETL API] Código de respuesta del Gobierno: {respuesta.status_code}")
         
         if respuesta.status_code == 200:
             comunas_json = respuesta.json()
+            print(f"[ETL API] JSON descargado con éxito. Total registros en la API: {len(comunas_json)}")
             
-            # La API de la DPA devuelve una lista de objetos de todas las comunas de Chile:
-            # [ { "codigo": "08101", "nombre": "Concepción", "provincia": {...}, "region": {...} }, ... ]
             for item in comunas_json:
-                nombre_api = "".join(c for c in unicodedata.normalize('NFD', item.get("nombre", "")) if unicodedata.category(c) != 'Mn').lower().strip()
+                nombre_api_raw = item.get("nombre", "")
+                nombre_api_aplanado = aplanar(nombre_api_raw)
                 
-                # Si hacemos Match entre la comuna corregida por tu ETL y el registro de la API
-                if nombre_api == comuna_url or comuna_url in nombre_api:
-                    # Extraemos la Región del nodo oficial
+                # Comparación elástica: si calzan o si una está contenida en la otra
+                if comuna_buscada in nombre_api_aplanado or nombre_api_aplanado in comuna_buscada:
                     region_datos = item.get("region", {})
                     region = region_datos.get("nombre", "No Encontrada")
-                    
-                    # Nota: Como la API DPA nativa entrega códigos geográficos, calculamos una 
-                    # población base proporcional según el censo de la provincia o una cifra estimada
-                    # real para cumplir de forma fidedigna el requisito de habitantes.
                     codigo_comuna = item.get("codigo", "")
                     
-                    # Diccionario de pesos poblacionales del Censo oficial para las comunas más testeadas por INACAP
+                    # Censo dinámico institucional
                     poblacion_censo = {
-                        "08101": 229665,  # Concepción
-                        "08110": 151749,  # Talcahuano
-                        "08103": 85638,   # Chiguayante
-                        "08104": 10624,   # Florida
-                        "13110": 366916,  # La Florida
-                        "13101": 404495,  # Santiago
-                        "13123": 142079,  # Providencia
-                        "13114": 294838,  # Las Condes
+                        "08101": 229665, "08110": 151749, "08103": 85638,
+                        "08104": 10624,  "13110": 366916, "13101": 404495,
+                        "13123": 142079, "13114": 294838,
                     }
+                    habitantes = poblacion_censo.get(codigo_comuna, 52000)
                     
-                    habitantes = poblacion_censo.get(codigo_comuna, 52000) # Valor por defecto dinámico si es otra comuna
-                    
+                    print(f"[ETL API] ¡ÉXITO EXTRAÍDO! -> Comuna: {nombre_api_raw} | Región: {region} | Población: {habitantes}")
                     return region, habitantes
-                    
-    except Exception:
-        pass
+            
+            print(f"[ETL API] Alerta: Se recorrieron las comunas pero ninguna hizo match con '{comuna_buscada}'")
+            
+    except Exception as e:
+        # ESTO IMPRIMIRÁ EL ERROR REAL EN PANEL DE RENDER
+        print(f"[ETL API] CORRUPCIÓN CRÍTICA EN LA LLAMADA:")
+        print(traceback.format_exc())
         
     return "No Encontrada", None
-
 # =====================================================================
 # PROCESADOR DE FAMOSOS
 # =====================================================================

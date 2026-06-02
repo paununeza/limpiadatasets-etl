@@ -136,7 +136,7 @@ const ejecutarETL = async (e, esManual = false) => {
           {pestana === 'comunas' && (
             <div style={{ padding: '12px', border: '1px dashed #4b5563', borderRadius: '6px', marginBottom: '15px', backgroundColor: '#1f2937' }}>
               <label style={{ fontSize: '13px', fontWeight: 'bold', color: '#3b82f6', display: 'block', marginBottom: '6px' }}>
-                🔍 Ingesta e Historial Manual
+                Búsqueda Manual - Ingresar comuna:
               </label>
               <div style={{ display: 'flex', gap: '8px' }}>
                 <input 
