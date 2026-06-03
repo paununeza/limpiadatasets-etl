@@ -1,7 +1,10 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import axios from 'axios';
 
-const API_BASE = (import.meta.env.VITE_API_BASE_URL || 'https://limpiadatasets-etl.onrender.com').replace(/\/$/, '');
+const API_BASE = (
+  import.meta.env.VITE_API_BASE_URL ||
+  (import.meta.env.DEV ? 'http://127.0.0.1:8000' : 'https://limpiadatasets-etl.onrender.com')
+).replace(/\/$/, '');
 const apiUrl = (ruta) => `${API_BASE}/api/etl/${ruta}`;
 
 function extraerCoordenadas(georeferencia) {
@@ -57,6 +60,9 @@ export default function App() {
   const [formato, setFormato] = useState('.txt');
   const [ordenar, setOrdenar] = useState(true);
   const [sensibilidad, setSensibilidad] = useState(0.70); // Control de umbral Fuzz
+  const [formatoTexto, setFormatoTexto] = useState('title'); // title | upper | lower
+  const [sugerenciasComuna, setSugerenciasComuna] = useState([]);
+  const [auditoria, setAuditoria] = useState(null);
 
   const [famosoSeleccionado, setFamosoSeleccionado] = useState(null); // Guardaremos el objeto completo
   const [urlImagenFamoso, setUrlImagenFamoso] = useState(null);
@@ -66,6 +72,9 @@ export default function App() {
 
   const [logs, setLogs] = useState([]);
   const [datosResultado, setDatosResultado] = useState([]);
+  const [datosExportacion, setDatosExportacion] = useState([]);
+  const [totalExportacion, setTotalExportacion] = useState(0);
+  const [totalUnicas, setTotalUnicas] = useState(0);
   const [centroMapa, setCentroMapa] = useState(null); // Estado para rastrear el marcador seleccionado en la tabla
   const [lugarSeleccionadoId, setLugarSeleccionadoId] = useState(null);
   const [busquedaLugar, setBusquedaLugar] = useState('');
@@ -194,29 +203,73 @@ export default function App() {
   const handleCambioArchivo = (e) => {
     setArchivo(e.target.files[0]);
     setComunaManual(''); // Si sube archivo, limpiamos el manual
+    setSugerenciasComuna([]);
+    setAuditoria(null);
     setLogs([]);
     setDatosResultado([]);
+    setDatosExportacion([]);
+    setTotalExportacion(0);
+    setTotalUnicas(0);
   };
 
-  const ejecutarETL = async (e, esManual = false) => {
+  const descargarLogAuditoria = () => {
+    const lineas = [...logs];
+    if (auditoria) {
+      lineas.unshift(
+        '--- RESUMEN AUDITORÍA ---',
+        `Fecha y hora: ${auditoria.fecha_hora}`,
+        `Registros leídos: ${auditoria.registros_leidos}`,
+        `Comunas procesadas: ${auditoria.comunas_procesadas}`,
+        `Duplicados eliminados: ${auditoria.duplicados_eliminados}`,
+        `Consolidados: ${auditoria.consolidados}`,
+        `No encontrados: ${auditoria.no_encontrados}`,
+        `Errores: ${auditoria.errores}`,
+        `Formato texto: ${auditoria.formato_texto}`,
+        '------------------------',
+        ''
+      );
+    }
+    const blob = new Blob([lineas.join('\n')], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.setAttribute('download', `auditoria_${pestana}_${new Date().toISOString().slice(0, 10)}.log`);
+    link.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const ejecutarETL = async (e, esManual = false, comunaConfirmada = null) => {
     if (e) e.preventDefault();
     
     // Validaciones de seguridad antes de disparar la petición
     if (!esManual && !archivo) return;
-    if (esManual && !comunaManual.trim()) return;
+    if (esManual && !comunaManual.trim() && !comunaConfirmada) return;
 
-    setDatosResultado([]);
+    if (!comunaConfirmada) {
+      setDatosResultado([]);
+      setDatosExportacion([]);
+      setTotalExportacion(0);
+      setTotalUnicas(0);
+      setSugerenciasComuna([]);
+    }
     setLogs([]);
+    setAuditoria(null);
     setCargando(true);
 
     const formData = new FormData();
     formData.append('sensibilidad', sensibilidad);
     formData.append('formato', formato);
     formData.append('ordenar', ordenar);
+    if (pestana === 'comunas') {
+      formData.append('formato_texto', formatoTexto);
+    }
     
     // Si es manual inyectamos el texto, si no, inyectamos el archivo binario
     if (esManual) {
       formData.append('comuna_manual', comunaManual.trim());
+      if (comunaConfirmada) {
+        formData.append('comuna_confirmada', comunaConfirmada);
+      }
     } else {
       formData.append('archivo', archivo);
     }
@@ -232,11 +285,24 @@ export default function App() {
     try {
       // Usamos AXIOS
       const respuesta = await axios.post(url, formData, {
-        headers: { 'Content-Type': 'multipart/form-data' }
+        headers: { 'Content-Type': 'multipart/form-data' },
+        timeout: pestana === 'comunas' ? 600000 : 60000,
       });
+
+      if (respuesta.data.needs_confirmation) {
+        setSugerenciasComuna(respuesta.data.sugerencias || []);
+        setLogs(respuesta.data.logs || []);
+        setAuditoria(respuesta.data.auditoria || null);
+        return;
+      }
       
-      setLogs(respuesta.data.logs);
-      setDatosResultado(respuesta.data.data);
+      setLogs(respuesta.data.logs || []);
+      setDatosResultado(respuesta.data.data_completa || respuesta.data.data || []);
+      setDatosExportacion(respuesta.data.data_completa || respuesta.data.data || []);
+      setTotalExportacion(respuesta.data.total_exportacion ?? (respuesta.data.data_completa?.length || 0));
+      setTotalUnicas(respuesta.data.total_unicas ?? respuesta.data.data?.length ?? 0);
+      setAuditoria(respuesta.data.auditoria || null);
+      setSugerenciasComuna([]);
       if (pestana === 'lugares') {
         setCentroMapa(null);
         setLugarSeleccionadoId(null);
@@ -244,41 +310,59 @@ export default function App() {
         setErrorLugares('');
       }
       
-      if (esManual) setComunaManual(''); // Limpia el cuadro de texto si fue exitoso
+      if (esManual) setComunaManual('');
     } catch (error) {
       console.error(error);
-      if (error.response) {
+      if (error.code === 'ECONNABORTED') {
+        alert(
+          'La operación tardó más de 10 minutos. Si el dataset es muy grande (10.000+ líneas), ' +
+          'espere un poco más o reinicie Django y vuelva a intentar.'
+        );
+      } else if (error.response) {
         alert(`Error del Servidor: ${error.response.status} - ${JSON.stringify(error.response.data)}`);
       } else {
-        alert("Error al conectar con el servidor Django. Revisa la consola para más detalles.");
+        const hint = import.meta.env.DEV
+          ? `No hay conexión con ${API_BASE}.\n\n1. Abre otra terminal en limpiadatasets-etl/limpia_datasets\n2. Ejecuta: python manage.py runserver\n3. Reinicia Vite si acabas de crear .env.local`
+          : `No hay conexión con ${API_BASE}. Comprueba que el backend en Render esté activo.`;
+        alert(hint);
       }
     } finally {
       setCargando(false);
     }
   };
 
+  const confirmarComunaSugerida = (nombreComuna) => {
+    ejecutarETL(null, true, nombreComuna);
+  };
+
   const descargarArchivoLimpio = () => {
+    const filas = datosExportacion.length > 0 ? datosExportacion : datosResultado;
     let contenido = "";
     if (formato === '.json') {
-      contenido = JSON.stringify(datosResultado, null, 2);
+      contenido = JSON.stringify(filas, null, 2);
     } else if (formato === '.csv') {
       if (pestana === 'comunas') {
         contenido = "ID;Comuna Normalizada;Region;Habitantes\n" + 
-          datosResultado.map(c => `${c.id};${c.valor_oficial};${c.region || 'No Encontrada'};${c.habitantes || 0}`).join("\n");
+          filas.map(c => `${c.id ?? ''};${c.valor_oficial};${c.region || 'Sin dato'};${c.habitantes ?? 'Sin dato'}`).join("\n");
       } else if (pestana === 'famosos') {
         contenido = "Nombre;Fecha Nacimiento;Edad;Cumpleaños\n" + 
-          datosResultado.map(f => `${f.nombre};${f.fecha_nacimiento_chile};${f.edad};${f.es_cumpleanos}`).join("\n");
+          filas.map(f => `${f.nombre};${f.fecha_nacimiento_chile};${f.edad};${f.es_cumpleanos}`).join("\n");
       } else {
         contenido = "Lugar;Calle;Numero;Ciudad/Provincia;Pais\n" + 
-          datosResultado.map(l => `${l.nombre_lugar};${l.direccion?.nombre_calle};${l.direccion?.numero_calle};${l.direccion?.ciudad_estado_provincia};${l.direccion?.pais}`).join("\n");
+          filas.map(l => `${l.nombre_lugar};${l.direccion?.nombre_calle};${l.direccion?.numero_calle};${l.direccion?.ciudad_estado_provincia};${l.direccion?.pais}`).join("\n");
       }
     } else {
       if (pestana === 'comunas') {
-        contenido = datosResultado.map(c => `${c.valor_oficial} - ${c.region || 'No Encontrada'}`).join("\n");
+        contenido = (
+          "Comuna;Region;Habitantes\n" +
+          filas.map(c =>
+            `${c.valor_oficial};${c.region || 'Sin dato'};${c.habitantes ?? 'Sin dato'}`
+          ).join("\n")
+        );
       } else if (pestana === 'famosos') {
-        contenido = datosResultado.map(f => `${f.nombre} - ${f.fecha_nacimiento_chile}`).join("\n");
+        contenido = filas.map(f => `${f.nombre} - ${f.fecha_nacimiento_chile}`).join("\n");
       } else {
-        contenido = datosResultado.map(l => `${l.nombre_lugar} - ${l.direccion?.nombre_calle} ${l.direccion?.numero_calle}`).join("\n");
+        contenido = filas.map(l => `${l.nombre_lugar} - ${l.direccion?.nombre_calle} ${l.direccion?.numero_calle}`).join("\n");
       }
     }
 
@@ -329,7 +413,17 @@ export default function App() {
 
       if (pageId !== "-1" && paginas[pageId].thumbnail) {
         imgUrl = paginas[pageId].thumbnail.source;
-        imgFuente = `Wikimedia Commons / Wikipedia Article: id ${pageId}`;
+        imgFuente = `Wikimedia Commons / Wikipedia (artículo id ${pageId})`;
+        const info = paginas[pageId].imageinfo?.[0];
+        if (info?.timestamp) {
+          const fechaApi = new Date(info.timestamp);
+          if (!Number.isNaN(fechaApi.getTime())) {
+            imgFecha = fechaApi.toLocaleString('es-CL', {
+              dateStyle: 'medium',
+              timeStyle: 'short',
+            });
+          }
+        }
       }
 
       setUrlImagenFamoso(imgUrl);
@@ -357,7 +451,14 @@ export default function App() {
     <div>
       <header>
         <h2>App LimpiaDatasets</h2>
-        <span style={{color: '#9ca3af', fontSize: '12px'}}>v1.6.0 (Métricas & API Enriquecida)</span>
+        <span style={{color: '#9ca3af', fontSize: '12px'}}>
+          v1.7.0 · API: {API_BASE}
+          {import.meta.env.DEV && (
+            <span style={{ display: 'block', color: '#6b7280', marginTop: '2px' }}>
+              Local: ejecute <code style={{ color: '#93c5fd' }}>python manage.py runserver</code> en limpia_datasets/
+            </span>
+          )}
+        </span>
       </header>
 
       <main>
@@ -366,8 +467,8 @@ export default function App() {
           <h3>Configuración</h3>
           
           <div className="tabs">
-            <button type="button" className={pestana === 'comunas' ? 'active' : ''} onClick={() => { setPestana('comunas'); setArchivo(null); setArchivoOficial(null); setComunaManual(''); setLogs([]); setDatosResultado([]); }}>Comunas</button>
-            <button type="button" className={pestana === 'famosos' ? 'active' : ''} onClick={() => { setPestana('famosos'); setArchivo(null); setLogs([]); setDatosResultado([]); }}>Famosos</button>
+            <button type="button" className={pestana === 'comunas' ? 'active' : ''} onClick={() => { setPestana('comunas'); setArchivo(null); setArchivoOficial(null); setComunaManual(''); setSugerenciasComuna([]); setAuditoria(null); setLogs([]); setDatosResultado([]); setDatosExportacion([]); setTotalExportacion(0); setTotalUnicas(0); }}>Comunas</button>
+            <button type="button" className={pestana === 'famosos' ? 'active' : ''} onClick={() => { setPestana('famosos'); setArchivo(null); setLogs([]); setDatosResultado([]); setDatosExportacion([]); setTotalExportacion(0); setTotalUnicas(0); }}>Famosos</button>
             <button type="button" className={pestana === 'lugares' ? 'active' : ''} onClick={() => { setPestana('lugares'); setArchivo(null); }}>Lugares</button>
           </div>
 
@@ -394,6 +495,35 @@ export default function App() {
                   Procesar
                 </button>
               </div>
+              {sugerenciasComuna.length > 0 && (
+                <div style={{ marginTop: '10px' }}>
+                  <p style={{ fontSize: '12px', color: '#fbbf24', margin: '0 0 8px 0' }}>
+                    Varias coincidencias para «{comunaManual}». Elija la comuna correcta:
+                  </p>
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px' }}>
+                    {sugerenciasComuna.map((s) => (
+                      <button
+                        key={s.nombre}
+                        type="button"
+                        onClick={() => confirmarComunaSugerida(s.nombre)}
+                        disabled={cargando}
+                        style={{
+                          padding: '6px 10px',
+                          borderRadius: '6px',
+                          border: '1px solid #3b82f6',
+                          backgroundColor: '#1e3a8a',
+                          color: '#fff',
+                          fontSize: '12px',
+                          cursor: 'pointer',
+                        }}
+                      >
+                        {s.nombre}
+                        {s.region && s.region !== 'No Encontrada' ? ` (${s.region})` : ' (sin región)'}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
             </div>
           )}
 
@@ -405,10 +535,15 @@ export default function App() {
 
             {pestana === 'comunas' && (
               <div className="form-group" style={{ borderLeft: '3px solid #10b981', paddingLeft: '10px', marginTop: '15px' }}>
-                <label style={{ color: '#10b981', fontWeight: 'bold' }}>Listado Oficial de Referencia (.txt) - Opcional</label>
-                <input type="file" accept=".txt" onChange={(e) => setArchivoOficial(e.target.files[0])} />
+                <label style={{ color: '#10b981', fontWeight: 'bold' }}>Listado Oficial de Referencia (.txt o .csv) - Opcional</label>
+                <input
+                  type="file"
+                  accept=".txt,.csv,text/plain,text/csv"
+                  onChange={(e) => setArchivoOficial(e.target.files[0] || null)}
+                />
                 <small style={{ color: '#6b7280', display: 'block', marginTop: '4px', lineHeight: '1.3' }}>
-                  Sube el diccionario para calibrar el algoritmo difuso.
+                  TXT: una comuna por línea. CSV: «Codigo;Nombre» o columna Comuna/Nombre (, o ;).
+                  Si no subes archivo, se usa el listado maestro del sistema (346 comunas).
                 </small>
               </div>
             )}
@@ -423,10 +558,20 @@ export default function App() {
             </div>
 
             {pestana === 'comunas' && (
-              <div className="form-group">
-                <label>Sensibilidad FUZZ: {Math.round(sensibilidad * 100)}%</label>
-                <input type="range" min="0.50" max="0.95" step="0.05" value={sensibilidad} onChange={(e) => setSensibilidad(parseFloat(e.target.value))} />
-              </div>
+              <>
+                <div className="form-group">
+                  <label>Formato del nombre de comuna</label>
+                  <select value={formatoTexto} onChange={(e) => setFormatoTexto(e.target.value)}>
+                    <option value="title">Título (La Florida)</option>
+                    <option value="upper">MAYÚSCULAS (LA FLORIDA)</option>
+                    <option value="lower">minúsculas (la florida)</option>
+                  </select>
+                </div>
+                <div className="form-group">
+                  <label>Sensibilidad FUZZ: {Math.round(sensibilidad * 100)}%</label>
+                  <input type="range" min="0.50" max="0.95" step="0.05" value={sensibilidad} onChange={(e) => setSensibilidad(parseFloat(e.target.value))} />
+                </div>
+              </>
             )}
 
             <div className="form-group" style={{display: 'flex', gap: '10px', alignItems: 'center'}}>
@@ -437,6 +582,11 @@ export default function App() {
             <button type="submit" className="btn btn-primary" disabled={cargando || !archivo}>
               {cargando ? 'Procesando Pipeline...' : 'Ejecutar Pipeline ETL'}
             </button>
+            {cargando && pestana === 'comunas' && archivoOficial && (
+              <p style={{ fontSize: '11px', color: '#93c5fd', marginTop: '8px', lineHeight: 1.4 }}>
+                Cargando diccionario y dataset… Con listado oficial grande suele tardar unos segundos (ya no minutos).
+              </p>
+            )}
             {pestana === 'lugares' && (
               <button
                 type="button"
@@ -450,22 +600,54 @@ export default function App() {
           </form>
 
           {datosResultado.length > 0 && (
-            <button type="button" onClick={descargarArchivoLimpio} className="btn btn-secondary" style={{ marginTop: '10px' }}>
-              Descargar Archivo Normalizado
-            </button>
+            <>
+              <button type="button" onClick={descargarArchivoLimpio} className="btn btn-secondary" style={{ marginTop: '10px' }}>
+                Descargar Archivo Normalizado
+                {totalUnicas > 0 ? ` (${totalUnicas} comunas)` : ''}
+              </button>
+            </>
           )}
         </div>
 
         {/* Panel Derecho: Consola de Logs y Vista de Base de Datos */}
         <div>
           <div className="card">
-            <h3>📋 Trazabilidad de Modificaciones (Logs)</h3>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '10px', flexWrap: 'wrap' }}>
+              <h3 style={{ margin: 0 }}>📋 Trazabilidad de Modificaciones (Logs)</h3>
+              {logs.length > 0 && (
+                <button
+                  type="button"
+                  className="btn btn-secondary"
+                  onClick={descargarLogAuditoria}
+                  style={{ padding: '4px 10px', fontSize: '11px', margin: 0 }}
+                >
+                  Descargar log
+                </button>
+              )}
+            </div>
+            {auditoria && (
+              <div style={{
+                marginTop: '10px',
+                padding: '10px',
+                borderRadius: '6px',
+                backgroundColor: '#1f2937',
+                border: '1px solid #374151',
+                fontSize: '11px',
+                color: '#d1d5db',
+                lineHeight: 1.5,
+              }}>
+                <strong style={{ color: '#10b981' }}>Resumen auditoría</strong>
+                <div>Fecha/hora: {auditoria.fecha_hora}</div>
+                <div>Leídos: {auditoria.registros_leidos} · Procesados: {auditoria.comunas_procesadas} · Duplicados: {auditoria.duplicados_eliminados}</div>
+                <div>Consolidados: {auditoria.consolidados} · No encontrados: {auditoria.no_encontrados} · Errores: {auditoria.errores}</div>
+              </div>
+            )}
             <div className="console">
               {logs.length === 0 ? (
                 <p style={{color: '#4b5563', fontStyle: 'italic'}}>Esperando datos... Procesa un archivo o usa el cuadro manual.</p>
               ) : (
                 logs.map((log, i) => (
-                  <p key={i} className={log.includes('ELIMINADO') ? 'log-error' : log.includes('FUZZ') ? 'log-fuzz' : ''}>
+                  <p key={i} className={log.includes('ELIMINADO') || log.includes('ERROR') ? 'log-error' : log.includes('FUZZ') || log.includes('AMBIGÜEDAD') ? 'log-fuzz' : ''}>
                     {log}
                   </p>
                 ))
@@ -475,6 +657,11 @@ export default function App() {
 
           <div className="card">
             <h3>🗄️ Vista Previa Base de Datos (Postgres)</h3>
+            {pestana === 'comunas' && datosResultado.length > 0 && totalUnicas > 0 && (
+              <p style={{ fontSize: '12px', color: '#93c5fd', margin: '0 0 10px 0' }}>
+                {datosResultado.length} comunas únicas — filas en rojo sin región o habitantes
+              </p>
+            )}
             <div className="table-container">
               {pestana === 'lugares' ? (
                 /* Módulo de Lugares: mapa siempre visible aunque no haya datos aún */
@@ -631,14 +818,23 @@ export default function App() {
                     </tr>
                   </thead>
                   <tbody>
-                    {datosResultado.map((c, i) => (
-                      <tr key={i}>
+                    {datosResultado.map((c, i) => {
+                      const sinRegion = !c.region || c.region === 'No Encontrada';
+                      const sinHab = c.habitantes == null || c.habitantes === 0;
+                      const incompleto = c.datos_completos === false || sinRegion || sinHab;
+                      return (
+                      <tr key={i} style={{ backgroundColor: incompleto ? 'rgba(127, 29, 29, 0.25)' : 'transparent' }}>
                         <td style={{color: '#6b7280', fontFamily: 'monospace'}}>{c.id}</td>
                         <td style={{color: 'white', fontWeight: 'bold'}}>{c.valor_oficial}</td>
-                        <td style={{color: '#10b981'}}>{c.region || 'No Encontrada'}</td>
-                        <td style={{color: '#3b82f6', fontFamily: 'monospace'}}>{c.habitantes ? c.habitantes.toLocaleString('cl-CL') : '0'}</td>
+                        <td style={{ color: sinRegion ? '#f87171' : '#10b981' }}>
+                          {sinRegion ? 'Sin dato en fuente' : c.region}
+                        </td>
+                        <td style={{ color: sinHab ? '#f87171' : '#3b82f6', fontFamily: 'monospace' }}>
+                          {sinHab ? '—' : c.habitantes.toLocaleString('cl-CL')}
+                        </td>
                       </tr>
-                    ))}
+                      );
+                    })}
                   </tbody>
                 </table>
               ) : pestana === 'famosos' ? (

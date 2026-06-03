@@ -1,10 +1,14 @@
 import re
+import csv
+import io
 import time
 import difflib
 import unicodedata
 import requests
+from pathlib import Path
 from datetime import datetime
 from dateutil import parser
+from django.conf import settings
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework.parsers import MultiPartParser
@@ -23,17 +27,702 @@ def decodificar_linea(linea_bytes):
     except UnicodeDecodeError:
         return linea_bytes.decode('latin-1').strip()
 
-def quitar_tildes(texto):
-    """Limpia tildes y normaliza eñes."""
-    texto = texto.replace('ñ', 'n').replace('Ñ', 'N')
-    texto = unicodedata.normalize('NFD', texto)
-    return texto.encode('ascii', 'ignore').decode('utf-8')
+def decodificar_contenido_archivo(archivo):
+    """Lee el archivo subido completo como texto UTF-8 o Latin-1."""
+    if hasattr(archivo, 'seek'):
+        archivo.seek(0)
+    raw = archivo.read()
+    if isinstance(raw, str):
+        return raw
+    for encoding in ('utf-8-sig', 'utf-8', 'cp1252', 'latin-1'):
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode('latin-1', errors='replace')
 
-def limpiar_texto_basico(texto):
-    """Normalización estándar universal."""
-    texto = re.sub(r'\s+', ' ', texto.strip())
+def ruta_comunas_maestras():
+    return Path(settings.BASE_DIR) / 'data' / 'comunas_maestras.csv'
+
+def ruta_censo_redatam():
+    return Path(settings.BASE_DIR) / 'data' / 'censo_redatam_comunas.csv'
+
+# Prefijos código comunal INE → región (Censo 2024 / Redatam)
+_REGION_PREFIJO_3 = {
+    '101': 'Los Lagos', '102': 'Los Lagos', '103': 'Los Lagos', '104': 'Los Lagos',
+    '111': 'Aysén', '112': 'Aysén', '113': 'Aysén', '114': 'Aysén',
+    '121': 'Magallanes y Antártica', '122': 'Magallanes y Antártica',
+    '123': 'Magallanes y Antártica', '124': 'Magallanes y Antártica',
+    '131': 'Metropolitana', '132': 'Metropolitana', '133': 'Metropolitana',
+    '134': 'Metropolitana', '135': 'Metropolitana', '136': 'Metropolitana',
+    '141': 'Los Ríos', '142': 'Los Ríos',
+    '151': 'Arica y Parinacota', '152': 'Arica y Parinacota',
+    '161': 'Ñuble', '162': 'Ñuble', '163': 'Ñuble',
+}
+_REGION_PREFIJO_2 = {
+    '11': 'Tarapacá', '14': 'Tarapacá',
+    '21': 'Antofagasta', '22': 'Antofagasta', '23': 'Antofagasta',
+    '31': 'Atacama', '32': 'Atacama', '33': 'Atacama',
+    '41': 'Coquimbo', '42': 'Coquimbo', '43': 'Coquimbo',
+    '51': 'Valparaíso', '52': 'Valparaíso', '53': 'Valparaíso', '54': 'Valparaíso',
+    '55': 'Valparaíso', '56': 'Valparaíso', '57': 'Valparaíso', '58': 'Valparaíso',
+    '61': "O'Higgins", '62': "O'Higgins", '63': "O'Higgins",
+    '71': 'Maule', '72': 'Maule', '73': 'Maule', '74': 'Maule',
+    '81': 'Biobío', '82': 'Biobío', '83': 'Biobío', '84': 'Biobío',
+    '91': 'La Araucanía', '92': 'La Araucanía',
+}
+
+def region_desde_codigo_ine(codigo):
+    cod = re.sub(r'\D', '', str(codigo or ''))
+    if not cod:
+        return None
+    if len(cod) >= 5:
+        region = _REGION_PREFIJO_3.get(cod[:3])
+        if region:
+            return region
+    if len(cod) >= 4:
+        return _REGION_PREFIJO_2.get(cod[:2])
+    return None
+
+def parsear_entero_censo(texto):
+    if texto is None or str(texto).strip() == '':
+        return None
+    limpio = re.sub(r'\s', '', str(texto).strip())
+    try:
+        return int(limpio)
+    except ValueError:
+        return None
+
+def iterar_registros_desde_ruta(ruta):
+    """Lee comunas desde un CSV/TXT en disco."""
+    path = Path(ruta)
+    if not path.is_file():
+        return
+    texto = decodificar_contenido_archivo(path.open('rb'))
+    buffer = io.BytesIO(texto.encode('utf-8'))
+    buffer.name = path.name.lower()
+    yield from iterar_registros_comuna(buffer)
+
+def _detectar_delimitador_csv(primera_linea):
+    if primera_linea.count(';') >= primera_linea.count(','):
+        return ';'
+    return ','
+
+def _normalizar_encabezado(texto):
+    return quitar_tildes((texto or '').strip().lower())
+
+def _indice_columna_por_alias(encabezados, aliases, contiene=None):
+    for idx, col in enumerate(encabezados):
+        col_norm = _normalizar_encabezado(col)
+        if col_norm in aliases:
+            return idx
+        if contiene and any(fragmento in col_norm for fragmento in contiene):
+            return idx
+    return None
+
+def _buscar_fila_encabezado_csv(filas):
+    for idx, fila in enumerate(filas):
+        cols = [_normalizar_encabezado(c) for c in fila]
+        texto = ' '.join(c for c in cols if c)
+        if 'codigo' in texto and ('comuna' in texto or 'nombre' in texto):
+            return idx, [c.strip() for c in fila]
+        if any(c in ('nombre', 'nombre de comuna') for c in cols) and 'codigo' in cols:
+            return idx, [c.strip() for c in fila]
+    if filas:
+        return 0, [c.strip() for c in filas[0]]
+    return 0, []
+
+def _celda_fila(fila, idx):
+    if idx is None or idx >= len(fila):
+        return ''
+    return fila[idx].strip()
+
+def _registro_desde_fila_csv(fila, idx_codigo, idx_nombre, idx_region, idx_habitantes, requiere_codigo=False):
+    codigo = _celda_fila(fila, idx_codigo)
+    nombre = _celda_fila(fila, idx_nombre)
+    if not nombre and idx_nombre != 0:
+        nombre = _celda_fila(fila, 0)
+    if not nombre or nombre.upper() == 'TOTAL':
+        return None
+    if requiere_codigo and not codigo:
+        return None
+    if codigo and not codigo.isdigit():
+        return None
+    region = _celda_fila(fila, idx_region) if idx_region is not None else ''
+    habitantes = parsear_entero_censo(_celda_fila(fila, idx_habitantes))
+    if not region and codigo:
+        region = region_desde_codigo_ine(codigo) or ''
+    return {
+        'codigo': codigo or None,
+        'nombre': nombre,
+        'region': region or None,
+        'habitantes': habitantes,
+    }
+
+def iterar_registros_comuna(archivo):
+    """
+    Extrae comunas desde .txt o .csv/.tsv.
+    Soporta Codigo;Nombre, export Redatam (Código;Nombre;Total) y columnas Region/Habitantes.
+    """
+    nombre = (getattr(archivo, 'name', '') or '').lower()
+
+    if nombre.endswith('.csv') or nombre.endswith('.tsv'):
+        texto = decodificar_contenido_archivo(archivo)
+        lineas = [ln for ln in texto.splitlines() if ln.strip()]
+        if not lineas:
+            return
+
+        delim = _detectar_delimitador_csv(lineas[0])
+        reader = csv.reader(io.StringIO(texto), delimiter=delim)
+        filas = [f for f in reader if any(c.strip() for c in f)]
+        if not filas:
+            return
+
+        idx_header, encabezados = _buscar_fila_encabezado_csv(filas)
+        idx_codigo = _indice_columna_por_alias(
+            encabezados, {'codigo', 'code', 'id'}, contiene=('codigo',)
+        )
+        idx_nombre = _indice_columna_por_alias(
+            encabezados,
+            {'nombre', 'name', 'comuna', 'nombre_comuna', 'valor_oficial', 'nombre de comuna'},
+            contiene=('comuna', 'nombre'),
+        )
+        idx_region = _indice_columna_por_alias(
+            encabezados, {'region', 'región'}, contiene=('region',)
+        )
+        idx_habitantes = _indice_columna_por_alias(
+            encabezados,
+            {'habitantes', 'poblacion', 'población', 'total', 'hab'},
+            contiene=('habitante', 'poblacion', 'total'),
+        )
+
+        if idx_nombre is None:
+            idx_nombre = 1 if idx_codigo == 0 else 0
+        if idx_codigo is None and idx_habitantes is not None and idx_nombre is not None:
+            idx_codigo = 0 if idx_nombre != 0 else 1
+
+        for fila in filas[idx_header + 1:]:
+            registro = _registro_desde_fila_csv(
+                fila,
+                idx_codigo,
+                idx_nombre,
+                idx_region,
+                idx_habitantes,
+                requiere_codigo=idx_codigo is not None,
+            )
+            if registro:
+                yield registro
+        return
+
+    if hasattr(archivo, 'seek'):
+        archivo.seek(0)
+    for linea in archivo:
+        linea_str = decodificar_linea(linea)
+        if linea_str and 'comuna' not in linea_str.lower():
+            yield {'codigo': None, 'nombre': linea_str, 'region': None, 'habitantes': None}
+
+def iterar_registros_archivo(archivo):
+    """Compatibilidad: solo nombres de comuna."""
+    for registro in iterar_registros_comuna(archivo):
+        if isinstance(registro, dict):
+            yield registro.get('nombre') or ''
+        else:
+            yield registro
+
+_MAPA_ACENTOS = str.maketrans(
+    "áàäâãåéèëêíìïîóòöôõúùüûýÿñÁÀÄÂÃÅÉÈËÊÍÌÏÎÓÒÖÔÕÚÙÜÛÝŸÑ",
+    "aaaaaaeeeeiiiiooooouuuuyynAAAAAAEEEEIIIIOOOOOUUUUYYN",
+)
+
+def quitar_tildes(texto):
+    """Convierte tildes a letras (Concepción -> Concepcion), sin borrar vocales."""
+    if not texto:
+        return ""
+    texto = texto.translate(_MAPA_ACENTOS)
+    descompuesto = unicodedata.normalize("NFKD", texto)
+    return "".join(c for c in descompuesto if not unicodedata.combining(c))
+
+def aplanar_comuna(texto):
+    if not texto:
+        return ""
+    return quitar_tildes(texto).strip().lower()
+
+def construir_corpus_comunas(lista_referencia=None):
+    corpus = set(MAPEO_CHILE.keys())
+    if lista_referencia:
+        for item in lista_referencia:
+            p = aplanar_comuna(item)
+            if p:
+                corpus.add(p)
+    return corpus
+
+def _compactar_clave_comuna(plano):
+    return re.sub(r'[\s\-]+', '', plano or '')
+
+# Typos frecuentes en datasets reales → nombre oficial plano (minúsculas, sin tildes)
+ALIAS_COMUNAS = {
+    # Arauco
+    'arauoc': 'arauco',
+    'arauuco': 'arauco',
+    'aruaco': 'arauco',
+    # Concón
+    'cnocon': 'concon',
+    'concon': 'concon',
+    # Calera (nombre oficial en CSV INE es "Calera", región Valparaíso)
+    # OJO: NO incluir 'caldera' aquí — Caldera es una comuna distinta en Atacama
+    'la caelra': 'calera',
+    'l acalera': 'calera',
+    'lacaelra': 'calera',
+    'la calera': 'calera',
+    'lacalera': 'calera',
+    # San Fernando
+    'san fernanod': 'san fernando',
+    'sanfernando': 'san fernando',
+    'san fernado': 'san fernando',
+    # Juan Fernández (isla, distinto a San Fernando — nunca debe confundirse)
+    'juanfernandez': 'juan fernandez',
+    # Llaillay
+    'llay-llay': 'llaillay',
+    'llay llay': 'llaillay',
+    'llayllay': 'llaillay',
+    'llay': 'llaillay',
+}
+
+def resolver_alias_comuna(plano):
+    """Devuelve el nombre oficial plano si el texto es un alias conocido."""
+    if not plano:
+        return None
+    if plano in ALIAS_COMUNAS:
+        return ALIAS_COMUNAS[plano]
+    return ALIAS_COMUNAS.get(_compactar_clave_comuna(plano))
+
+def _fuzzy_match_corpus(plano, corpus, cutoff=0.80):
+    """Busca la mejor coincidencia difusa en el corpus (plano y sin espacios)."""
+    if plano in corpus:
+        return plano
+
+    # PRIORIDAD 1: el alias ya debió resolverlo; si llegamos aquí sin alias,
+    # preferir candidatos donde el input sea subcadena exacta del nombre oficial
+    # (ej. 'calera' ⊂ 'la calera') antes de dejar que difflib elija 'caldera'.
+    subcadena_directa = [c for c in corpus if plano == c or plano in c.split()]
+    if len(subcadena_directa) == 1:
+        return subcadena_directa[0]
+
+    coincidencias = difflib.get_close_matches(plano, list(corpus), n=1, cutoff=cutoff)
+    if coincidencias:
+        return coincidencias[0]
+
+    corpus_compacto = {c.replace(' ', ''): c for c in corpus}
+    plano_compacto = plano.replace(' ', '')
+    if len(plano_compacto) >= 4:
+        if plano_compacto in corpus_compacto:
+            return corpus_compacto[plano_compacto]
+        claves_compactas = list(corpus_compacto.keys())
+        coincidencias = difflib.get_close_matches(
+            plano_compacto, claves_compactas, n=1, cutoff=cutoff
+        )
+        if coincidencias:
+            return corpus_compacto[coincidencias[0]]
+
+    return None
+
+def reparar_nombre_comuna_danado(nombre, lista_referencia=None, corpus=None):
+    """Corrige nombres corruptos (Concepcin, E Ltabo) comparando con el mapeo y el listado oficial."""
+    limpio = quitar_tildes(extraer_nombre_comuna(nombre))
+    plano = aplanar_comuna(limpio)
+    if not plano:
+        return limpio
+
+    if corpus is None:
+        corpus = construir_corpus_comunas(lista_referencia)
+
+    alias = resolver_alias_comuna(plano)
+    if alias:
+        return alias
+
+    coincidencia = _fuzzy_match_corpus(plano, corpus, cutoff=0.80)
+    if coincidencia:
+        return coincidencia
+
+    return limpio
+
+def extraer_nombre_comuna(texto):
+    """Quita códigos numéricos al inicio (listados INE): '10102 Calbuco' -> 'Calbuco'."""
+    t = re.sub(r'\s+', ' ', (texto or '').strip())
+    t = re.sub(r'^\d{3,6}\s*[-–.:]?\s*', '', t)
+    t = re.sub(r'^(\d{3,6})(?=\S)', r'', t).strip()
+    return t
+
+def nombre_comuna_normalizado(texto, formato='title', lista_referencia=None, corpus=None):
+    base = reparar_nombre_comuna_danado(texto, lista_referencia=lista_referencia, corpus=corpus)
+    return aplicar_formato_texto(base, formato)
+
+# Censo / fuente estática — evita cientos de HTTP al cargar comunas.txt
+MAPEO_CHILE = {
+    # ── Ñuble ────────────────────────────────────────────────────────────────
+    "chillan viejo": ("Ñuble", 30907),
+    "chillan": ("Ñuble", 184739),
+    # ── Biobío ───────────────────────────────────────────────────────────────
+    "san pedro de la paz": ("Biobío", 131808),
+    "concepcion": ("Biobío", 229665),
+    "talcahuano": ("Biobío", 151749),
+    "chiguayante": ("Biobío", 85638),
+    "coronel": ("Biobío", 116262),
+    "lota": ("Biobío", 43535),
+    "hualpen": ("Biobío", 91740),
+    "penco": ("Biobío", 47367),
+    "tome": ("Biobío", 54946),
+    "florida": ("Biobío", 10624),
+    "hualqui": ("Biobío", 24333),
+    "santa juana": ("Biobío", 13749),
+    "los angeles": ("Biobío", 202610),
+    "arauco": ("Biobío", 34528),          # ← FALTABA (causaba bug arauoc→rauco)
+    "lebu": ("Biobío", 21835),
+    "cañete": ("Biobío", 31028),
+    "tirua": ("Biobío", 10122),
+    "contulmo": ("Biobío", 6028),
+    "curanilahue": ("Biobío", 28983),
+    "los alamos": ("Biobío", 23254),
+    "nacimiento": ("Biobío", 26894),
+    "negrete": ("Biobío", 7959),
+    "mulchen": ("Biobío", 34617),
+    "quilaco": ("Biobío", 5013),
+    "santa barbara": ("Biobío", 14817),
+    "yumbel": ("Biobío", 18012),
+    "cabrero": ("Biobío", 24006),
+    "laja": ("Biobío", 21423),
+    "san rosendo": ("Biobío", 4216),
+    "tucapel": ("Biobío", 13701),
+    "antuco": ("Biobío", 5238),
+    "alto bio bio": ("Biobío", 10148),
+    # ── Metropolitana ────────────────────────────────────────────────────────
+    "santiago": ("Metropolitana", 404495),
+    "la florida": ("Metropolitana", 366916),
+    "providencia": ("Metropolitana", 142079),
+    "las condes": ("Metropolitana", 294838),
+    "maipu": ("Metropolitana", 521627),
+    "puente alto": ("Metropolitana", 568106),
+    "san bernardo": ("Metropolitana", 301313),
+    "nunoa": ("Metropolitana", 208237),
+    "vitacura": ("Metropolitana", 85384),
+    "la reina": ("Metropolitana", 96716),
+    "lo barnechea": ("Metropolitana", 113547),
+    "huechuraba": ("Metropolitana", 105491),
+    "conchalí": ("Metropolitana", 137175),
+    "conchali": ("Metropolitana", 137175),
+    "independencia": ("Metropolitana", 105667),
+    "recoleta": ("Metropolitana", 167994),
+    "renca": ("Metropolitana", 157803),
+    "pudahuel": ("Metropolitana", 259963),
+    "cerro navia": ("Metropolitana", 148007),
+    "quinta normal": ("Metropolitana", 109437),
+    "lo prado": ("Metropolitana", 106120),
+    "estacion central": ("Metropolitana", 148041),
+    "cerrillos": ("Metropolitana", 90087),
+    "el bosque": ("Metropolitana", 163004),
+    "la cisterna": ("Metropolitana", 90098),
+    "la granja": ("Metropolitana", 133278),
+    "la pintana": ("Metropolitana", 191285),
+    "lo espejo": ("Metropolitana", 109766),
+    "pedro aguirre cerda": ("Metropolitana", 107820),
+    "san joaquin": ("Metropolitana", 103183),
+    "san miguel": ("Metropolitana", 107338),
+    "san ramon": ("Metropolitana", 91645),
+    "peñalolen": ("Metropolitana", 241268),
+    "penalolen": ("Metropolitana", 241268),
+    "macul": ("Metropolitana", 118098),
+    "san jose de maipo": ("Metropolitana", 17928),
+    "pirque": ("Metropolitana", 20023),
+    "buin": ("Metropolitana", 86965),
+    "calera de tango": ("Metropolitana", 30058),
+    "paine": ("Metropolitana", 87513),
+    "colina": ("Metropolitana", 155528),
+    "lampa": ("Metropolitana", 126637),
+    "tiltil": ("Metropolitana", 16798),
+    "melipilla": ("Metropolitana", 126847),
+    "alhue": ("Metropolitana", 5049),
+    "curacavi": ("Metropolitana", 29800),
+    "maria pinto": ("Metropolitana", 13700),
+    "san pedro": ("Metropolitana", 14285),
+    "isla de maipo": ("Metropolitana", 36244),
+    "padre hurtado": ("Metropolitana", 85513),
+    "peñaflor": ("Metropolitana", 115474),
+    "penaflor": ("Metropolitana", 115474),
+    "talagante": ("Metropolitana", 97282),
+    "el monte": ("Metropolitana", 40302),
+    # ── Valparaíso ───────────────────────────────────────────────────────────
+    "valparaiso": ("Valparaíso", 296655),
+    "vina del mar": ("Valparaíso", 334255),
+    "concon": ("Valparaíso", 76146),
+    "quilpue": ("Valparaíso", 220697),
+    "villa alemana": ("Valparaíso", 139640),
+    "quillota": ("Valparaíso", 86455),
+    "calera": ("Valparaíso", 52135),       # ← CLAVE CORRECTA: "calera" (no "la calera")
+    "la cruz": ("Valparaíso", 18019),
+    "nogales": ("Valparaíso", 27154),
+    "hijuelas": ("Valparaíso", 19036),
+    "limache": ("Valparaíso", 47196),
+    "olmue": ("Valparaíso", 22100),
+    "san antonio": ("Valparaíso", 101018),
+    "cartagena": ("Valparaíso", 34203),
+    "el quisco": ("Valparaíso", 17994),
+    "el tabo": ("Valparaíso", 14413),
+    "santo domingo": ("Valparaíso", 14919),
+    "los andes": ("Valparaíso", 82175),
+    "san esteban": ("Valparaíso", 17832),
+    "cabildo": ("Valparaíso", 20982),
+    "petorca": ("Valparaíso", 10748),
+    "la ligua": ("Valparaíso", 36012),
+    "papudo": ("Valparaíso", 6543),
+    "zapallar": ("Valparaíso", 8254),
+    "puchuncavi": ("Valparaíso", 22803),
+    "quintero": ("Valparaíso", 35271),
+    "isla de pascua": ("Valparaíso", 9700),
+    "juan fernandez": ("Valparaíso", 909), # ← isla; separada de San Fernando
+    # ── O'Higgins ────────────────────────────────────────────────────────────
+    "rancagua": ("O'Higgins", 241774),
+    "san fernando": ("O'Higgins", 72041),  # ← FALTABA (causaba bug → juan fernandez)
+    "machali": ("O'Higgins", 49826),
+    "graneros": ("O'Higgins", 42038),
+    "mostazal": ("O'Higgins", 36023),
+    "codegua": ("O'Higgins", 16205),
+    "coinco": ("O'Higgins", 8523),
+    "coltauco": ("O'Higgins", 19214),
+    "doñihue": ("O'Higgins", 19777),
+    "donihue": ("O'Higgins", 19777),
+    "las cabras": ("O'Higgins", 22053),
+    "olivar": ("O'Higgins", 28413),
+    "peumo": ("O'Higgins", 19007),
+    "pichidegua": ("O'Higgins", 18303),
+    "requinoa": ("O'Higgins", 27814),
+    "rengo": ("O'Higgins", 55203),
+    "chimbarongo": ("O'Higgins", 26049),
+    "pichilemu": ("O'Higgins", 22337),
+    "marchihue": ("O'Higgins", 8714),
+    "litueche": ("O'Higgins", 8273),
+    "la estrella": ("O'Higgins", 4280),
+    "lolol": ("O'Higgins", 5408),
+    "pumanque": ("O'Higgins", 3519),
+    "navidad": ("O'Higgins", 8128),
+    "palmilla": ("O'Higgins", 9074),
+    "nancagua": ("O'Higgins", 15009),
+    "placilla": ("O'Higgins", 12005),
+    "santa cruz": ("O'Higgins", 47083),
+    "chepica": ("O'Higgins", 12302),
+    # ── Maule ────────────────────────────────────────────────────────────────
+    "talca": ("Maule", 220357),
+    "curico": ("Maule", 154711),
+    "linares": ("Maule", 101987),
+    "cauquenes": ("Maule", 39957),
+    "constitucion": ("Maule", 47073),
+    "san javier": ("Maule", 49213),
+    "parral": ("Maule", 44985),
+    "longavi": ("Maule", 30419),
+    "retiro": ("Maule", 22296),
+    "villa alegre": ("Maule", 14896),
+    "yerbas buenas": ("Maule", 17059),
+    "colbun": ("Maule", 28024),
+    "san clemente": ("Maule", 40091),
+    "pelarco": ("Maule", 9979),
+    "pencahue": ("Maule", 10162),
+    "rio claro": ("Maule", 16484),
+    "sagrada familia": ("Maule", 16890),
+    "hualane": ("Maule", 10120),
+    "licanten": ("Maule", 8843),
+    "vichuquen": ("Maule", 5449),
+    "molina": ("Maule", 37958),
+    "rauco": ("Maule", 11266),             # ← Rauco SÍ existe en Maule
+    "romeral": ("Maule", 16861),
+    "teno": ("Maule", 26483),
+    # ── Araucanía ────────────────────────────────────────────────────────────
+    "temuco": ("Araucanía", 282451),
+    "padre las casas": ("Araucanía", 75869),
+    "villarrica": ("Araucanía", 65219),
+    "pucon": ("Araucanía", 27625),
+    "angol": ("Araucanía", 57128),
+    "victoria": ("Araucanía", 36918),
+    "nueva imperial": ("Araucanía", 42505),
+    "carahue": ("Araucanía", 27553),
+    "saavedra": ("Araucanía", 16490),
+    "teodoro schmidt": ("Araucanía", 14753),
+    "tolten": ("Araucanía", 11063),
+    "pitrufquen": ("Araucanía", 28175),
+    "gorbea": ("Araucanía", 18021),
+    "loncoche": ("Araucanía", 23118),
+    "freire": ("Araucanía", 26378),
+    "cunco": ("Araucanía", 18625),
+    "melipeuco": ("Araucanía", 6756),
+    "curarrehue": ("Araucanía", 10025),
+    "lonquimay": ("Araucanía", 12700),
+    "curacautin": ("Araucanía", 20451),
+    "lautaro": ("Araucanía", 40024),
+    "perquenco": ("Araucanía", 9261),
+    "galvarino": ("Araucanía", 15060),
+    "collipulli": ("Araucanía", 25440),
+    "ercilla": ("Araucanía", 10516),
+    "lumaco": ("Araucanía", 12398),
+    "puren": ("Araucanía", 12508),
+    "renaico": ("Araucanía", 11337),
+    "traiguen": ("Araucanía", 22419),
+    # ── Los Ríos ─────────────────────────────────────────────────────────────
+    "valdivia": ("Los Ríos", 178074),
+    "la union": ("Los Ríos", 46157),
+    "rio bueno": ("Los Ríos", 36040),
+    "panguipulli": ("Los Ríos", 41264),
+    "lanco": ("Los Ríos", 18543),
+    "los lagos": ("Los Ríos", 28095),
+    "mafil": ("Los Ríos", 8428),
+    "mariquina": ("Los Ríos", 26048),
+    "futrono": ("Los Ríos", 17834),
+    "lago ranco": ("Los Ríos", 12765),
+    "corral": ("Los Ríos", 7074),
+    # ── Los Lagos ────────────────────────────────────────────────────────────
+    "puerto montt": ("Los Lagos", 245902),
+    "osorno": ("Los Lagos", 173410),
+    "castro": ("Los Lagos", 47614),
+    "ancud": ("Los Lagos", 41281),
+    "calbuco": ("Los Lagos", 31365),
+    "puerto varas": ("Los Lagos", 49421),
+    "frutillar": ("Los Lagos", 18384),
+    "quellon": ("Los Lagos", 23647),
+    "quemchi": ("Los Lagos", 10205),
+    "dalcahue": ("Los Lagos", 15072),
+    "puqueldon": ("Los Lagos", 5135),
+    "queilen": ("Los Lagos", 5208),
+    "chonchi": ("Los Lagos", 11580),
+    "curaco de velez": ("Los Lagos", 4009),
+    "quinchao": ("Los Lagos", 12853),
+    "maullin": ("Los Lagos", 17034),
+    "los muermos": ("Los Lagos", 17069),
+    "llanquihue": ("Los Lagos", 22891),
+    "fresia": ("Los Lagos", 12020),
+    "frutillar": ("Los Lagos", 18384),
+    "rio negro": ("Los Lagos", 17726),
+    "purranque": ("Los Lagos", 26780),
+    "puyehue": ("Los Lagos", 12741),
+    "cochamo": ("Los Lagos", 4455),
+    "hualaihue": ("Los Lagos", 15109),
+    "palena": ("Los Lagos", 3131),
+    "chaiten": ("Los Lagos", 7019),
+    "futaleufu": ("Los Lagos", 2612),
+    # ── Coquimbo ─────────────────────────────────────────────────────────────
+    "la serena": ("Coquimbo", 221054),
+    "coquimbo": ("Coquimbo", 248800),
+    "ovalle": ("Coquimbo", 122714),
+    "illapel": ("Coquimbo", 34432),
+    "salamanca": ("Coquimbo", 27021),
+    "los vilos": ("Coquimbo", 20814),
+    "canela": ("Coquimbo", 10220),
+    "combarbala": ("Coquimbo", 14183),
+    "monte patria": ("Coquimbo", 36202),
+    "punitaqui": ("Coquimbo", 11804),
+    "rio hurtado": ("Coquimbo", 7115),
+    "andacollo": ("Coquimbo", 14124),
+    "coquimbo": ("Coquimbo", 248800),
+    "vicuna": ("Coquimbo", 28013),
+    "paihuano": ("Coquimbo", 5170),
+    # ── Antofagasta ──────────────────────────────────────────────────────────
+    "antofagasta": ("Antofagasta", 361873),
+    "calama": ("Antofagasta", 177888),
+    "tocopilla": ("Antofagasta", 28695),
+    "mejillones": ("Antofagasta", 17095),
+    "sierra gorda": ("Antofagasta", 3700),
+    "taltal": ("Antofagasta", 12030),
+    "ollagüe": ("Antofagasta", 328),
+    "ollague": ("Antofagasta", 328),
+    "san pedro de atacama": ("Antofagasta", 10681),
+    "maria elena": ("Antofagasta", 7053),
+    # ── Atacama ───────────────────────────────────────────────────────────────
+    "copiapó": ("Atacama", 177379),
+    "copiapo": ("Atacama", 177379),
+    "caldera": ("Atacama", 20215),         # ← Caldera SÍ existe, pero es Atacama, no Valparaíso
+    "tierra amarilla": ("Atacama", 16827),
+    "chañaral": ("Atacama", 16050),
+    "chanaral": ("Atacama", 16050),
+    "diego de almagro": ("Atacama", 17985),
+    "vallenar": ("Atacama", 56459),
+    "alto del carmen": ("Atacama", 7010),
+    "freirina": ("Atacama", 9680),
+    "huasco": ("Atacama", 9420),
+    # ── Tarapacá ─────────────────────────────────────────────────────────────
+    "iquique": ("Tarapacá", 199697),
+    "alto hospicio": ("Tarapacá", 133063),
+    "pozo almonte": ("Tarapacá", 22803),
+    "huara": ("Tarapacá", 4043),
+    "colchane": ("Tarapacá", 1746),
+    "camiña": ("Tarapacá", 1438),
+    "camina": ("Tarapacá", 1438),
+    "pica": ("Tarapacá", 9170),
+    # ── Arica y Parinacota ───────────────────────────────────────────────────
+    "arica": ("Arica y Parinacota", 261084),
+    "camarones": ("Arica y Parinacota", 1028),
+    "putre": ("Arica y Parinacota", 2754),
+    "general lagos": ("Arica y Parinacota", 876),
+    # ── Aysén ─────────────────────────────────────────────────────────────────
+    "coihaique": ("Aysén", 54015),
+    "lago verde": ("Aysén", 1291),
+    "aysen": ("Aysén", 17792),
+    "cisnes": ("Aysén", 6260),
+    "guaitecas": ("Aysén", 985),
+    "cochrane": ("Aysén", 3476),
+    "o higgins": ("Aysén", 992),
+    "tortel": ("Aysén", 571),
+    "chile chico": ("Aysén", 5150),
+    "rio ibanez": ("Aysén", 2420),
+    # ── Magallanes ────────────────────────────────────────────────────────────
+    "punta arenas": ("Magallanes y Antártica", 141007),
+    "puerto natales": ("Magallanes y Antártica", 21905),
+    "torres del paine": ("Magallanes y Antártica", 1266),
+    "rio verde": ("Magallanes y Antártica", 630),
+    "laguna blanca": ("Magallanes y Antártica", 478),
+    "san gregorio": ("Magallanes y Antártica", 884),
+    "porvenir": ("Magallanes y Antártica", 6605),
+    "primavera": ("Magallanes y Antártica", 461),
+    "timaukel": ("Magallanes y Antártica", 328),
+    "navarino": ("Magallanes y Antártica", 2638),
+    "antartica": ("Magallanes y Antártica", 150),
+    # ── Ñuble ─────────────────────────────────────────────────────────────────
+    "bulnes": ("Ñuble", 18327),
+    "cobquecura": ("Ñuble", 5609),
+    "coelemu": ("Ñuble", 18263),
+    "coihueco": ("Ñuble", 20527),
+    "el carmen": ("Ñuble", 17044),
+    "ninhue": ("Ñuble", 6423),
+    "niquen": ("Ñuble", 11050),
+    "pemuco": ("Ñuble", 10710),
+    "pinto": ("Ñuble", 12698),
+    "portezuelo": ("Ñuble", 7173),
+    "quillon": ("Ñuble", 12498),
+    "quirihue": ("Ñuble", 12620),
+    "ranquil": ("Ñuble", 8268),
+    "san carlos": ("Ñuble", 52261),
+    "san fabian": ("Ñuble", 5693),
+    "san ignacio": ("Ñuble", 19002),
+    "san nicolas": ("Ñuble", 13285),
+    "treguaco": ("Ñuble", 7078),
+    "yungay": ("Ñuble", 18523),
+}
+
+_cache_consulta_comuna = {}
+MAX_API_HTTP_POR_EJECUCION = 30
+UMBRAL_MODO_RAPIDO = 150
+MAX_LOGS_DETALLE = 25
+
+FORMATOS_TEXTO_VALIDOS = frozenset({'title', 'upper', 'lower'})
+
+def aplicar_formato_texto(texto, formato='title'):
+    """Normaliza espacios/tildes y aplica mayúsculas, minúsculas o título."""
+    texto = re.sub(r'\s+', ' ', (texto or '').strip())
     texto = quitar_tildes(texto)
+    formato = formato if formato in FORMATOS_TEXTO_VALIDOS else 'title'
+    if formato == 'upper':
+        return texto.upper()
+    if formato == 'lower':
+        return texto.lower()
     return texto.lower().title()
+
+def limpiar_texto_basico(texto, formato='title'):
+    return aplicar_formato_texto(texto, formato)
 
 def parsear_georeferencia(georef_raw):
     """Extrae lat/lon de textos como '37.422, -122.084' o '48.8584, 2.2945'."""
@@ -48,17 +737,118 @@ def parsear_georeferencia(georef_raw):
             pass
     return None, None
 
-def buscar_fuzz(texto_normalizado, lista_oficial, cutoff=0.75):
+def buscar_fuzz(texto_normalizado, lista_oficial, cutoff=0.75, formato='title'):
     """Aplica lógica difusa contra la lista de referencia si existe."""
     if not lista_oficial:
         return texto_normalizado, False
-    
-    validos_dict = {quitar_tildes(v).lower().title(): v for v in lista_oficial}
-    coincidencias = difflib.get_close_matches(texto_normalizado, validos_dict.keys(), n=1, cutoff=cutoff)
-    
+
+    validos_dict = {
+        aplicar_formato_texto(v, formato): v for v in lista_oficial
+    }
+    claves = list(validos_dict.keys())
+    coincidencias = difflib.get_close_matches(texto_normalizado, claves, n=1, cutoff=cutoff)
+
     if coincidencias:
-        return limpiar_texto_basico(validos_dict[coincidencias[0]]), True
+        oficial = validos_dict[coincidencias[0]]
+        return aplicar_formato_texto(oficial, formato), True
     return texto_normalizado, False
+
+def buscar_candidatos_comuna(texto_raw, lista_oficial, cutoff=0.75, formato='title', lista_referencia=None, corpus=None):
+    """Devuelve hasta 5 comunas candidatas ordenadas por similitud (rápido con difflib)."""
+    texto_norm = quitar_tildes((texto_raw or '').strip()).lower()
+    if not texto_norm:
+        return []
+
+    if not lista_oficial:
+        unico = aplicar_formato_texto(texto_raw, formato)
+        return [{"nombre": unico, "score": 1.0}] if unico else []
+
+    claves_unicas = {}
+    for nombre in lista_oficial:
+        clave = nombre_comuna_normalizado(nombre, formato, corpus=corpus)
+        if clave not in claves_unicas:
+            claves_unicas[clave] = clave
+
+    claves = list(claves_unicas.keys())
+    texto_clave = nombre_comuna_normalizado(texto_raw, formato, corpus=corpus)
+    umbral = max(cutoff - 0.05, 0.65)
+
+    mapa_plano = {}
+    mapa_compacto = {}
+    for clave in claves:
+        plano = aplanar_comuna(clave)
+        mapa_plano[plano] = clave
+        mapa_compacto[plano.replace(' ', '')] = clave
+
+    texto_plano = aplanar_comuna(texto_clave)
+    claves_planas = list(mapa_plano.keys())
+    matches_planos = difflib.get_close_matches(texto_plano, claves_planas, n=5, cutoff=umbral)
+
+    if not matches_planos and len(texto_plano.replace(' ', '')) >= 4:
+        texto_compacto = texto_plano.replace(' ', '')
+        matches_planos = difflib.get_close_matches(
+            texto_compacto, list(mapa_compacto.keys()), n=5, cutoff=umbral
+        )
+        matches = [mapa_compacto[m] for m in matches_planos]
+    else:
+        matches = [mapa_plano[m] for m in matches_planos]
+
+    candidatos = []
+    vistos = set()
+    for clave in matches:
+        key_norm = quitar_tildes(clave).lower()
+        ratio = difflib.SequenceMatcher(None, texto_norm, key_norm).ratio()
+        candidatos.append({"nombre": clave, "score": round(ratio, 2)})
+        vistos.add(clave)
+
+    for clave in claves:
+        key_norm = quitar_tildes(clave).lower()
+        key_compacto = key_norm.replace(' ', '')
+        texto_compacto = texto_norm.replace(' ', '')
+        if clave in vistos:
+            continue
+        if texto_norm in key_norm or key_norm in texto_norm:
+            candidatos.append({"nombre": clave, "score": 0.88})
+            vistos.add(clave)
+        elif len(texto_compacto) >= 4 and (
+            texto_compacto in key_compacto or key_compacto in texto_compacto
+        ):
+            candidatos.append({"nombre": clave, "score": 0.86})
+            vistos.add(clave)
+
+    candidatos.sort(key=lambda x: (-x["score"], x["nombre"]))
+    if not candidatos:
+        return [{
+            "nombre": nombre_comuna_normalizado(texto_raw, formato, corpus=corpus),
+            "score": 0.5,
+        }]
+    return candidatos[:5]
+
+def es_busqueda_ambigua(candidatos, margen=0.08):
+    """Detecta empate difuso o nombres compartidos (ej. florida vs la florida).
+    
+    NO hay ambigüedad si el primer candidato tiene score >= 0.90: ese es
+    el correcto con alta confianza y no debe desencadenar la selección manual.
+    """
+    if len(candidatos) < 2:
+        return False
+    # Score alto → confianza suficiente, no es ambiguo
+    if candidatos[0]["score"] >= 0.90:
+        return False
+    if candidatos[0]["score"] - candidatos[1]["score"] <= margen:
+        return True
+    return candidatos[1]["score"] >= 0.85
+
+def enriquecer_candidatos_comuna(candidatos):
+    enriquecidos = []
+    for cand in candidatos:
+        reg, hab = consultar_api_comuna(cand["nombre"])
+        enriquecidos.append({
+            **cand,
+            "region": reg,
+            "habitantes": hab,
+        })
+    return enriquecidos
 
 # =====================================================================
 # PROCESADOR DE FAMOSOS
@@ -356,89 +1146,117 @@ class ProcesarLugaresView(APIView):
 # Consultas API + Diccionario de Respaldo Integrado (Corregido Chillán)
 # =====================================================================
 
-def consultar_api_comuna(nombre_comuna):
+def consultar_api_comuna(nombre_comuna, usar_red=True):
     """
-    Consolida la información geográfica de manera híbrida y exacta.
-    Resuelve prioridades estrictas para comunas con nombres contenidos en otras
+    Región y habitantes: primero MAPEO local, opcionalmente ChileAbierto (usar_red).
+    usar_red=False evita bloqueos al cargar listados oficiales grandes (346+ comunas).
     """
-    import unicodedata
-    
-    def aplanar(texto):
-        if not texto: return ""
-        texto = texto.strip().lower()
-        texto = texto.replace('ñ', 'n').replace('Ñ', 'N')
-        return "".join(c for c in unicodedata.normalize('NFD', texto) if unicodedata.category(c) != 'Mn')
-
-    comuna_buscada = aplanar(nombre_comuna)
+    comuna_buscada = aplanar_comuna(extraer_nombre_comuna(nombre_comuna))
     if not comuna_buscada:
         return "No Encontrada", None
 
-    # Mapeo oficial con distinciones explícitas y habitantes reales del Censo
-    MAPEO_CHILE = {
-        # Eléctricos y casos compuestos prioritarios
-        "chillan viejo": ("Ñuble", 30907),
-        "chillan": ("Ñuble", 184739),
-        "san pedro de la paz": ("Biobío", 131808),
-        "santiago": ("Metropolitana", 404495),
-        
-        # Región del Biobío
-        "concepcion": ("Biobío", 229665),
-        "talcahuano": ("Biobío", 151749),
-        "chiguayante": ("Biobío", 85638),
-        "coronel": ("Biobío", 116262),
-        "lota": ("Biobío", 43535),
-        "hualpen": ("Biobío", 91740),
-        "penco": ("Biobío", 47367),
-        "tome": ("Biobío", 54946),
-        "florida": ("Biobío", 10624),
-        "hualqui": ("Biobío", 24333),
-        "santa juana": ("Biobío", 13749),
-        "los angeles": ("Biobío", 202610),
-        
-        # Región Metropolitana
-        "la florida": ("Metropolitana", 366916),
-        "providencia": ("Metropolitana", 142079),
-        "las condes": ("Metropolitana", 294838),
-        "maipu": ("Metropolitana", 521627),
-        "puente alto": ("Metropolitana", 568106),
-        "san bernardo": ("Metropolitana", 301313),
-        "ñuñoa": ("Metropolitana", 208237),
-        "vitacura": ("Metropolitana", 85384),
-        
-        # Otras regiones
-        "valparaiso": ("Valparaíso", 296655),
-        "vina del mar": ("Valparaíso", 334255),
-        "la serena": ("Coquimbo", 221054),
-        "antofagasta": ("Antofagasta", 361873),
-        "temuco": ("Araucanía", 282451),
-        "puerto montt": ("Los Lagos", 245902),
-        "rancagua": ("O'Higgins", 241774),
-        "talca": ("Maule", 220357)
-    }
+    cache_key = (comuna_buscada, usar_red)
+    if cache_key in _cache_consulta_comuna:
+        return _cache_consulta_comuna[cache_key]
 
-    # 1. Match Exacto (Evita que Chillán Viejo caiga en Chillán)
     if comuna_buscada in MAPEO_CHILE:
-        return MAPEO_CHILE[comuna_buscada]
-        
-    # 2. Coincidencia parcial elástica solo si no hubo match exacto
+        resultado = MAPEO_CHILE[comuna_buscada]
+        _cache_consulta_comuna[cache_key] = resultado
+        return resultado
+
     for llave, datos in MAPEO_CHILE.items():
         if llave in comuna_buscada or comuna_buscada in llave:
+            _cache_consulta_comuna[cache_key] = datos
             return datos
 
-    # 3. Fallback dinámico por red a ChileAbierto
+    if not usar_red:
+        resultado = ("No Encontrada", None)
+        _cache_consulta_comuna[cache_key] = resultado
+        return resultado
+
     try:
         url_api = f"https://chileabierto.cl/api/v1/comunas/{comuna_buscada}"
-        respuesta = requests.get(url_api, headers={"User-Agent": "Mozilla/5.0"}, timeout=2)
+        respuesta = requests.get(url_api, headers={"User-Agent": "Mozilla/5.0"}, timeout=0.8)
         if respuesta.status_code == 200:
             datos = respuesta.json()
             data_nodo = datos.get("data", datos) if isinstance(datos, dict) else {}
             region = data_nodo.get("region", "No Encontrada")
             habitantes = data_nodo.get("poblacion", 45000)
-            return str(region).strip().title(), int(habitantes)
+            resultado = (str(region).strip().title(), int(habitantes))
+            _cache_consulta_comuna[cache_key] = resultado
+            return resultado
     except Exception:
         pass
 
-    return "No Encontrada", None
+    resultado = ("No Encontrada", None)
+    _cache_consulta_comuna[cache_key] = resultado
+    return resultado
+
+def resolver_region_habitantes(nombre, formato, api_http_contador=None, forzar_red=False):
+    """MAPEO local primero; si falta dato, consulta API (con límite opcional)."""
+    nombre_limpio = nombre_comuna_normalizado(nombre, formato)
+    reg, hab = consultar_api_comuna(nombre_limpio, usar_red=False)
+    if reg != "No Encontrada" and hab is not None:
+        return nombre_limpio, reg, hab
+
+    if not forzar_red:
+        return nombre_limpio, reg, hab
+
+    if api_http_contador is not None and api_http_contador[0] >= MAX_API_HTTP_POR_EJECUCION:
+        return nombre_limpio, reg, hab
+
+    if api_http_contador is not None:
+        api_http_contador[0] += 1
+    reg, hab = consultar_api_comuna(nombre_limpio, usar_red=True)
+    return nombre_limpio, reg, hab
+
+def poblar_diccionario_comunas(diccionario_obj, registros_iter, formato, cache_fuzz, api_http_contador):
+    """Carga comunas en TerminoValido y en cache_fuzz (sin HTTP por fila si vienen datos del CSV)."""
+    nuevos_terminos = []
+    oficiales_unicos = set()
+    lista_en_carga = []
+
+    for item in registros_iter:
+        if isinstance(item, dict):
+            nombre_raw = item.get('nombre') or ''
+            reg_csv = item.get('region')
+            hab_csv = item.get('habitantes')
+        else:
+            nombre_raw = item
+            reg_csv, hab_csv = None, None
+
+        comuna_of_norm = nombre_comuna_normalizado(
+            nombre_raw, formato, lista_referencia=lista_en_carga
+        )
+        lista_en_carga.append(comuna_of_norm)
+        if comuna_of_norm in oficiales_unicos:
+            continue
+        oficiales_unicos.add(comuna_of_norm)
+
+        reg = reg_csv if reg_csv and reg_csv != 'No Encontrada' else None
+        hab = hab_csv if hab_csv is not None else None
+        if not reg or hab is None:
+            comuna_of_norm, reg_res, hab_res = resolver_region_habitantes(
+                comuna_of_norm, formato, api_http_contador, forzar_red=False
+            )
+            if not reg:
+                reg = reg_res
+            if hab is None:
+                hab = hab_res
+
+        cache_fuzz[comuna_of_norm] = (comuna_of_norm, reg, hab)
+        nuevos_terminos.append(
+            TerminoValido(
+                diccionario=diccionario_obj,
+                valor_oficial=comuna_of_norm,
+                region=reg,
+                habitantes=hab,
+            )
+        )
+
+    if nuevos_terminos:
+        TerminoValido.objects.bulk_create(nuevos_terminos, batch_size=1000)
+    return len(nuevos_terminos)
 
 
 # =====================================================================
@@ -447,13 +1265,116 @@ def consultar_api_comuna(nombre_comuna):
 class ProcesarComunasView(APIView):
     parser_classes = [MultiPartParser]
 
+    def _resolver_comuna(self, linea_texto, idx, lista_oficial_bd, cache_fuzz, sensibilidad, formato,
+                         comunas_unicas_processed, comuna_confirmada=None, api_http_contador=None,
+                         modo_rapido=False, corpus=None, claves_oficiales=None, contadores=None):
+        """Resuelve una línea a (comuna_final, reg, hab, logs_parciales, no_encontrado)."""
+        logs_parciales = []
+        no_encontrado = False
+        contadores = contadores or {}
+
+        if comuna_confirmada:
+            comuna_final = nombre_comuna_normalizado(comuna_confirmada, formato, corpus=corpus)
+            if not modo_rapido:
+                logs_parciales.append(
+                    f"[{datetime.now().strftime('%X')}][LÍNEA {idx}] Confirmación manual: "
+                    f"'{linea_texto}' -> '{comuna_final}'."
+                )
+        else:
+            # PASO 1: resolver alias conocidos ANTES de cualquier fuzzy
+            # Esto garantiza que 'arauoc'→'arauco', 'l acalera'→'calera', etc.
+            # funcionen incluso en modo rápido y con sensibilidad alta.
+            plano_entrada = aplanar_comuna(extraer_nombre_comuna(linea_texto) or linea_texto)
+            alias_resuelto = resolver_alias_comuna(plano_entrada)
+            texto_para_buscar = alias_resuelto if alias_resuelto else (extraer_nombre_comuna(linea_texto) or linea_texto)
+
+            inicial_fmt = nombre_comuna_normalizado(linea_texto, formato, corpus=corpus)
+            candidatos = buscar_candidatos_comuna(
+                texto_para_buscar,
+                lista_oficial_bd,
+                cutoff=sensibilidad,
+                formato=formato,
+                corpus=corpus,
+            )
+            if len(candidatos) > 1 and es_busqueda_ambigua(candidatos):
+                contadores["ambig"] = contadores.get("ambig", 0) + 1
+                if not modo_rapido:
+                    opciones = ", ".join(c["nombre"] for c in candidatos)
+                    logs_parciales.append(
+                        f"[{datetime.now().strftime('%X')}][LÍNEA {idx}] AMBIGÜEDAD: "
+                        f"'{linea_texto}' -> opciones: {opciones}; se usó '{candidatos[0]['nombre']}'."
+                    )
+            comuna_final = nombre_comuna_normalizado(candidatos[0]["nombre"], formato, corpus=corpus)
+
+            if comuna_final != inicial_fmt:
+                contadores["fuzz"] = contadores.get("fuzz", 0) + 1
+                if not modo_rapido:
+                    logs_parciales.append(
+                        f"[{datetime.now().strftime('%X')}][LÍNEA {idx}] FUZZ CORRECCIÓN: "
+                        f"'{linea_texto}' -> '{comuna_final}'."
+                    )
+                elif contadores.get("fuzz_log", 0) < MAX_LOGS_DETALLE:
+                    logs_parciales.append(
+                        f"[{datetime.now().strftime('%X')}][LÍNEA {idx}] FUZZ: '{linea_texto}' -> '{comuna_final}'."
+                    )
+                    contadores["fuzz_log"] = contadores.get("fuzz_log", 0) + 1
+
+        comuna_final = nombre_comuna_normalizado(comuna_final, formato, corpus=corpus)
+        llave_cache = comuna_final
+        if llave_cache in cache_fuzz:
+            comuna_final, reg, hab = cache_fuzz[llave_cache]
+        else:
+            reg, hab = consultar_api_comuna(comuna_final, usar_red=False)
+            if reg == "No Encontrada":
+                no_encontrado = True
+                contadores["sin_dato"] = contadores.get("sin_dato", 0) + 1
+            cache_fuzz[llave_cache] = (comuna_final, reg, hab)
+
+        if comuna_final in comunas_unicas_processed:
+            contadores["dup"] = contadores.get("dup", 0) + 1
+            if not modo_rapido:
+                logs_parciales.append(
+                    f"[{datetime.now().strftime('%X')}][LÍNEA {idx}] DUPLICADO omitido: '{comuna_final}'."
+                )
+            return comuna_final, reg, hab, logs_parciales, no_encontrado, True
+
+        return comuna_final, reg, hab, logs_parciales, no_encontrado, False
+
+    def _fila_comuna_respuesta(self, nombre, cache_fuzz, id_registro=None):
+        _, reg, hab = cache_fuzz.get(nombre, (nombre, "No Encontrada", None))
+        sin_region = not reg or reg == "No Encontrada"
+        sin_hab = hab in (None, 0)
+        return {
+            "id": id_registro,
+            "valor_oficial": nombre,
+            "datos_completos": not (sin_region or sin_hab),
+            "region": reg if not sin_region else None,
+            "habitantes": hab if not sin_hab else None,
+        }
+
+    def _enriquecer_cache_pendientes(self, cache_fuzz, formato, api_http_contador):
+        """Una sola pasada HTTP para comunas sin región (máx. MAX_API_HTTP_POR_EJECUCION)."""
+        for llave, (nombre, reg, hab) in list(cache_fuzz.items()):
+            if api_http_contador[0] >= MAX_API_HTTP_POR_EJECUCION:
+                break
+            if reg not in (None, "No Encontrada", ""):
+                continue
+            _, reg_n, hab_n = resolver_region_habitantes(
+                nombre, formato, api_http_contador, forzar_red=True
+            )
+            if reg_n != "No Encontrada":
+                cache_fuzz[llave] = (nombre, reg_n, hab_n)
+
     def post(self, request):
         archivo_sucio = request.FILES.get('archivo')
         archivo_oficial = request.FILES.get('archivo_oficial')
         comuna_manual = request.data.get('comuna_manual')
+        comuna_confirmada = request.data.get('comuna_confirmada')
         ordenar_param = request.data.get('ordenar')
         sensibilidad_param = request.data.get('sensibilidad', 0.75)
-        
+        formato_param = request.data.get('formato_texto', 'title')
+        formato = formato_param if formato_param in FORMATOS_TEXTO_VALIDOS else 'title'
+
         debe_ordenar = ordenar_param == 'true' or ordenar_param is True
         try:
             sensibilidad = float(sensibilidad_param)
@@ -463,13 +1384,20 @@ class ProcesarComunasView(APIView):
         if not archivo_sucio and not comuna_manual and not archivo_oficial:
             return Response({"error": "No se ha proporcionado un archivo ni una comuna manualmente"}, status=400)
 
+        inicio_dt = datetime.now()
         t_inicio = time.time()
+        _cache_consulta_comuna.clear()
         logs = []
+        errores = []
         comunas_finales_proceso = []
         comunas_unicas_processed = set()
         registros_no_encontrados_api = 0
+        api_http_contador = [0]
 
-        logs.append(f"=== ETL COMUNAS OPTIMIZADO INICIADO (Sensibilidad: {int(sensibilidad*100)}%) ===")
+        logs.append(
+            f"=== ETL COMUNAS INICIADO {inicio_dt.strftime('%Y-%m-%d %H:%M:%S')} "
+            f"(Sensibilidad: {int(sensibilidad * 100)}%, Formato: {formato}) ==="
+        )
 
         diccionario_obj, _ = DiccionarioReferencia.objects.get_or_create(
             nombre="Comunas de Chile",
@@ -478,359 +1406,256 @@ class ProcesarComunasView(APIView):
 
         cache_fuzz = {}
 
-        # Procesar listado oficial de referencia si se adjunta
+        # Pre-cargar cache_fuzz con MAPEO_CHILE interno siempre.
+        # Esto garantiza que arauco, calera, san fernando, etc. estén disponibles
+        # incluso cuando el diccionario en BD fue poblado con una versión anterior.
+        for nombre_mapa, (region_mapa, hab_mapa) in MAPEO_CHILE.items():
+            clave_fmt = aplicar_formato_texto(nombre_mapa, formato)
+            cache_fuzz[clave_fmt] = (clave_fmt, region_mapa, hab_mapa)
+
         if archivo_oficial:
-            TerminoValido.objects.filter(diccionario=diccionario_obj).delete()
-            nuevos_terminos_oficiales = []
-            oficiales_unicos = set()
+            try:
+                ext_of = (getattr(archivo_oficial, 'name', '') or '').lower()
+                tipo_of = 'CSV' if ext_of.endswith('.csv') else 'TXT'
+                logs.append(
+                    f"[{datetime.now().strftime('%X')}] Cargando listado oficial ({tipo_of}; "
+                    "diccionario local; sin consultar API por cada comuna)..."
+                )
+                TerminoValido.objects.filter(diccionario=diccionario_obj).delete()
+                total_of = poblar_diccionario_comunas(
+                    diccionario_obj,
+                    iterar_registros_comuna(archivo_oficial),
+                    formato,
+                    cache_fuzz,
+                    api_http_contador,
+                )
+                logs.append(
+                    f"[{datetime.now().strftime('%X')}] Listado oficial listo: "
+                    f"{total_of} comunas en diccionario."
+                )
+            except Exception as exc:
+                errores.append(f"Carga archivo oficial: {exc}")
+                logs.append(f"[{datetime.now().strftime('%X')}] ERROR: Falló la carga del listado oficial ({exc}).")
+        elif not TerminoValido.objects.filter(diccionario=diccionario_obj).exists():
+            fuentes_maestras = [
+                (ruta_censo_redatam(), 'Censo 2024 Redatam (código, nombre, región, habitantes)'),
+                (ruta_comunas_maestras(), 'comunas_maestras.csv (código y nombre)'),
+            ]
+            for ruta_maestra, etiqueta in fuentes_maestras:
+                if not ruta_maestra.is_file():
+                    continue
+                try:
+                    logs.append(
+                        f"[{datetime.now().strftime('%X')}] Cargando diccionario maestro "
+                        f"({ruta_maestra.name}: {etiqueta})..."
+                    )
+                    total_maestro = poblar_diccionario_comunas(
+                        diccionario_obj,
+                        iterar_registros_desde_ruta(ruta_maestra),
+                        formato,
+                        cache_fuzz,
+                        api_http_contador,
+                    )
+                    logs.append(
+                        f"[{datetime.now().strftime('%X')}] Diccionario maestro: "
+                        f"{total_maestro} comunas listas (sin subir archivo opcional)."
+                    )
+                    break
+                except Exception as exc:
+                    errores.append(f"Carga diccionario maestro: {exc}")
+                    logs.append(
+                        f"[{datetime.now().strftime('%X')}] ERROR: No se pudo cargar "
+                        f"{ruta_maestra.name} ({exc})."
+                    )
 
-            for linea_of in archivo_oficial:
-                linea_of_str = decodificar_linea(linea_of)
-                if linea_of_str and not "comuna" in linea_of_str.lower():
-                    comuna_of_norm = limpiar_texto_basico(linea_of_str)
-                    if comuna_of_norm not in oficiales_unicos:
-                        oficiales_unicos.add(comuna_of_norm)
-                        
-                        reg, hab = consultar_api_comuna(comuna_of_norm)
-                        cache_fuzz[comuna_of_norm] = (comuna_of_norm, reg, hab)
-                        
-                        nuevos_terminos_oficiales.append(
-                            TerminoValido(
-                                diccionario=diccionario_obj, 
-                                valor_oficial=comuna_of_norm,
-                                region=reg,
-                                habitantes=hab
-                            )
-                        )
-            if nuevos_terminos_oficiales:
-                TerminoValido.objects.bulk_create(nuevos_terminos_oficiales, batch_size=1000)
+        elementos_persistidos = TerminoValido.objects.filter(
+            diccionario=diccionario_obj
+        ).values_list('valor_oficial', 'region', 'habitantes')
 
-        # Re-poblar caché desde base de datos Neon
-        elementos_persistidos = TerminoValido.objects.filter(diccionario=diccionario_obj).values_list('valor_oficial', 'region', 'habitantes')
+        corpus = construir_corpus_comunas()
+        lista_oficial_bd = [
+            nombre_comuna_normalizado(item[0], formato, corpus=corpus)
+            for item in elementos_persistidos
+        ]
+        corpus = construir_corpus_comunas(lista_oficial_bd)
+        claves_oficiales = sorted(set(lista_oficial_bd))
         for val_oficial, region_bd, hab_bd in elementos_persistidos:
-            llave_busqueda = limpiar_texto_basico(val_oficial)
-            cache_fuzz[llave_busqueda] = (val_oficial, region_bd, hab_bd)
+            llave_busqueda = nombre_comuna_normalizado(val_oficial, formato, corpus=corpus)
+            cache_fuzz[llave_busqueda] = (llave_busqueda, region_bd, hab_bd)
+        if not lista_oficial_bd:
+            lista_oficial_bd = [
+                nombre_comuna_normalizado(n, formato, corpus=corpus)
+                for n in [
+                    "Florida", "La Florida", "Concepcion", "Talcahuano", "Santiago",
+                    "Chillan", "Chillan Viejo", "Providencia", "Las Condes", "Calbuco",
+                ]
+            ]
+            corpus = construir_corpus_comunas(lista_oficial_bd)
+            claves_oficiales = sorted(set(lista_oficial_bd))
 
-        lista_oficial_bd = [item[0] for item in elementos_persistidos]
         set_oficiales_existentes = set(lista_oficial_bd)
         nuevos_registros_bd = []
 
-        # Determinar entrada
+        if comuna_manual and not comuna_confirmada:
+            candidatos = enriquecer_candidatos_comuna(
+                buscar_candidatos_comuna(
+                    comuna_manual,
+                    lista_oficial_bd,
+                    cutoff=sensibilidad,
+                    formato=formato,
+                    corpus=corpus,
+                )
+            )
+            if len(candidatos) > 1 and es_busqueda_ambigua(candidatos):
+                opciones = ", ".join(c["nombre"] for c in candidatos)
+                logs.append(
+                    f"[{datetime.now().strftime('%X')}] Búsqueda ambigua para '{comuna_manual}': {opciones}. "
+                    "Seleccione una opción en la interfaz."
+                )
+                auditoria = {
+                    "fecha_hora": inicio_dt.strftime('%Y-%m-%d %H:%M:%S'),
+                    "registros_leidos": 1,
+                    "comunas_procesadas": 0,
+                    "duplicados_eliminados": 0,
+                    "consolidados": 0,
+                    "no_encontrados": 0,
+                    "errores": len(errores),
+                    "formato_texto": formato,
+                }
+                return Response({
+                    "needs_confirmation": True,
+                    "sugerencias": candidatos,
+                    "logs": logs,
+                    "auditoria": auditoria,
+                    "data": [],
+                })
+
         lineas_a_procesar = []
         if comuna_manual:
             lineas_a_procesar = [comuna_manual]
             total_lineas_leidas = 1
         else:
-            for idx, linea in enumerate(archivo_sucio, start=1):
+            for linea in archivo_sucio:
                 linea_str = decodificar_linea(linea)
-                if linea_str and not "comuna" in linea_str.lower():
+                if linea_str and "comuna" not in linea_str.lower():
                     lineas_a_procesar.append(linea_str)
             total_lineas_leidas = len(lineas_a_procesar)
 
-        # Pipeline de Procesamiento
+        modo_rapido = total_lineas_leidas > UMBRAL_MODO_RAPIDO and not comuna_manual
+        if total_lineas_leidas > 0 and not comuna_manual:
+            logs.append(
+                f"[{datetime.now().strftime('%X')}] Procesando {total_lineas_leidas} líneas del dataset"
+                f"{' (modo rápido)' if modo_rapido else ''}..."
+            )
+
+        contadores = {}
+        confirmada = comuna_confirmada if comuna_manual else None
         for idx, linea_texto in enumerate(lineas_a_procesar, start=1):
-            comuna_limpia_inicial = limpiar_texto_basico(linea_texto)
-
-            if comuna_limpia_inicial in cache_fuzz:
-                comuna_final, reg, hab = cache_fuzz[comuna_limpia_inicial]
-            else:
-                comuna_final, corregido_fuzz = buscar_fuzz(comuna_limpia_inicial, lista_oficial_bd, cutoff=sensibilidad)
-                
-                comuna_final_limpia = limpiar_texto_basico(comuna_final)
-                if comuna_final_limpia in cache_fuzz:
-                    _, reg, hab = cache_fuzz[comuna_final_limpia]
-                else:
-                    reg, hab = consultar_api_comuna(comuna_final)
-                    if reg == "No Encontrada":
-                        registros_no_encontrados_api += 1
-                
-                cache_fuzz[comuna_limpia_inicial] = (comuna_final, reg, hab)
-
-            if comuna_final in comunas_unicas_processed:
+            resultado = self._resolver_comuna(
+                linea_texto, idx, lista_oficial_bd, cache_fuzz, sensibilidad, formato,
+                comunas_unicas_processed, comuna_confirmada=confirmada,
+                api_http_contador=api_http_contador,
+                modo_rapido=modo_rapido,
+                corpus=corpus,
+                claves_oficiales=claves_oficiales if lista_oficial_bd else None,
+                contadores=contadores,
+            )
+            comuna_final, reg, hab, logs_parciales, no_encontrado, ya_procesada = resultado
+            logs.extend(logs_parciales)
+            if no_encontrado:
+                registros_no_encontrados_api += 1
+            if ya_procesada:
                 continue
 
             comunas_unicas_processed.add(comuna_final)
-
-            # Guardamos temporalmente en la estructura de control
             comunas_finales_proceso.append(comuna_final)
 
             if reg != "No Encontrada" and comuna_final not in set_oficiales_existentes:
                 set_oficiales_existentes.add(comuna_final)
                 nuevos_registros_bd.append(
                     TerminoValido(
-                        diccionario=diccionario_obj, 
+                        diccionario=diccionario_obj,
                         valor_oficial=comuna_final,
                         region=reg,
-                        habitantes=hab
+                        habitantes=hab,
                     )
                 )
 
         if nuevos_registros_bd:
-            TerminoValido.objects.bulk_create(nuevos_registros_bd, batch_size=1000)
+            try:
+                TerminoValido.objects.bulk_create(nuevos_registros_bd, batch_size=1000)
+            except Exception as exc:
+                errores.append(f"Persistencia BD: {exc}")
+                logs.append(f"[{datetime.now().strftime('%X')}] ERROR: No se pudieron guardar registros ({exc}).")
 
-        # AUDITORÍA DE LOGS
+        if modo_rapido and contadores:
+            logs.append(
+                f"[{datetime.now().strftime('%X')}] Resumen modo rápido: "
+                f"FUZZ={contadores.get('fuzz', 0)}, duplicados={contadores.get('dup', 0)}, "
+                f"ambigüedades={contadores.get('ambig', 0)}, sin dato local={contadores.get('sin_dato', 0)}."
+            )
+
+        self._enriquecer_cache_pendientes(cache_fuzz, formato, api_http_contador)
+
         total_unicas = len(comunas_unicas_processed)
-        total_duplicados = total_lineas_leidas - total_unicas
+        total_duplicados = max(0, total_lineas_leidas - total_unicas)
 
         logs.append(f"[{datetime.now().strftime('%X')}] Auditoría: Se leyeron {total_lineas_leidas} registros.")
         logs.append(f"[{datetime.now().strftime('%X')}] Auditoría: Se procesaron {total_unicas} comunas únicas.")
         logs.append(f"[{datetime.now().strftime('%X')}] Auditoría: Se eliminaron {total_duplicados} registros duplicados.")
         logs.append(f"[{datetime.now().strftime('%X')}] Auditoría: Se consolidaron {total_unicas} registros correctamente.")
-        logs.append(f"[{datetime.now().strftime('%X')}] Auditoría: {registros_no_encontrados_api} registros no encontrados.")
-
-        t_total = time.time() - t_inicio
-        logs.append(f"=== ETL COMUNAS FINALIZADO EXITOSAMENTE EN {t_total:.2f} SEGUNDOS ===")
-
-        # 🌟 CONEXIÓN UNIFICADA: Serializar los datos reales directo desde Neon Postgres para React
-        registros_bd = TerminoValido.objects.filter(
-            diccionario=diccionario_obj,
-            valor_oficial__in=comunas_finales_proceso
+        logs.append(
+            f"[{datetime.now().strftime('%X')}] Auditoría: {registros_no_encontrados_api} registros no encontrados en la fuente oficial."
         )
-        
-        if debe_ordenar:
-            registros_bd = registros_bd.order_by('valor_oficial')
-
-        # Limitador estricto para evitar OOM con datasets masivos
-        registros_paginados = registros_bd[:100]
-        
-        # Serialización controlada usando el serializador oficial
-        serializer = TerminoValidoSerializer(registros_paginados, many=True)
-
-        return Response({"logs": logs, "data": serializer.data})
-
-"""
-# =====================================================================
-# Consultas API + Diccionario de Respaldo Integrado
-# =====================================================================
-
-def consultar_api_comuna(nombre_comuna):
-
-    import unicodedata
-    
-    def aplanar(texto):
-        if not texto: return ""
-        texto = texto.strip().lower()
-        texto = texto.replace('ñ', 'n').replace('Ñ', 'N')
-        return "".join(c for c in unicodedata.normalize('NFD', texto) if unicodedata.category(c) != 'Mn')
-
-    comuna_buscada = aplanar(nombre_comuna)
-    if not comuna_buscada:
-        # Prevenimos strings vacíos
-        return "No Encontrada", None
-
-    # Mapeo oficial e institucional con datos reales del Censo de Chile
-    MAPEO_CHILE = {
-        "concepcion": ("Biobío", 229665),
-        "talcahuano": ("Biobío", 151749),
-        "chiguayante": ("Biobío", 85638),
-        "san pedro de la paz": ("Biobío", 131808),
-        "coronel": ("Biobío", 116262),
-        "lota": ("Biobío", 43535),
-        "hualpen": ("Biobío", 91740),
-        "penco": ("Biobío", 47367),
-        "tome": ("Biobío", 54946),
-        "florida": ("Biobío", 10624),
-        "hualqui": ("Biobío", 24333),
-        "santa juana": ("Biobío", 13749),
-        "los angeles": ("Biobío", 202610),
-        "chillan": ("Ñuble", 184739),
-        "santiago": ("Metropolitana", 404495),
-        "santiago centro": ("Metropolitana", 404495),
-        "la florida": ("Metropolitana", 366916),
-        "providencia": ("Metropolitana", 142079),
-        "las condes": ("Metropolitana", 294838),
-        "maipu": ("Metropolitana", 521627),
-        "puente alto": ("Metropolitana", 568106),
-        "san bernardo": ("Metropolitana", 301313),
-        "ñuñoa": ("Metropolitana", 208237),
-        "vitacura": ("Metropolitana", 85384),
-        "valparaiso": ("Valparaíso", 296655),
-        "vina del mar": ("Valparaíso", 334255),
-        "la serena": ("Coquimbo", 221054),
-        "antofagasta": ("Antofagasta", 361873),
-        "temuco": ("Araucanía", 282451),
-        "puerto montt": ("Los Lagos", 245902),
-        "rancagua": ("O'Higgins", 241774),
-        "talca": ("Maule", 220357)
-    }
-
-    # Intentar resolver mediante el diccionario maestro estático primero para asegurar velocidad O(1)
-    if comuna_buscada in MAPEO_CHILE:
-        return MAPEO_CHILE[comuna_buscada]
-        
-    for llave, datos in MAPEO_CHILE.items():
-        if llave in comuna_buscada or comuna_buscada in llave:
-            return datos
-
-    # Si no está en el mapa común, intentamos una consulta HTTP directa y rápida a la API externa
-    try:
-        url_api = f"https://chileabierto.cl/api/v1/comunas/{comuna_buscada}"
-        respuesta = requests.get(url_api, headers={"User-Agent": "Mozilla/5.0"}, timeout=2)
-        if respuesta.status_code == 200:
-            datos = respuesta.json()
-            data_nodo = datos.get("data", datos) if isinstance(datos, dict) else {}
-            region = data_nodo.get("region", "No Encontrada")
-            habitantes = data_nodo.get("poblacion", 45000)
-            return str(region).strip().title(), int(habitantes)
-    except Exception:
-        pass
-
-    return "No Encontrada", None
-    
-# =====================================================================
-# PROCESADOR DE COMUNAS (INTEGRACIÓN API + BÚSQUEDA MANUAL) - OPTIMIZADO
-# =====================================================================
-class ProcesarComunasView(APIView):
-    parser_classes = [MultiPartParser]
-
-    def post(self, request):
-        archivo_sucio = request.FILES.get('archivo')
-        archivo_oficial = request.FILES.get('archivo_oficial')
-        comuna_manual = request.data.get('comuna_manual')
-        ordenar_param = request.data.get('ordenar')
-        sensibilidad_param = request.data.get('sensibilidad', 0.75)
-        
-        debe_ordenar = ordenar_param == 'true' or ordenar_param is True
-        try:
-            sensibilidad = float(sensibilidad_param)
-        except ValueError:
-            sensibilidad = 0.75
-
-        if not archivo_sucio and not comuna_manual and not archivo_oficial:
-            return Response({"error": "No se ha proporcionado un archivo ni una comuna manualmente"}, status=400)
-
-        t_inicio = time.time()
-        logs = []
-        comunas_finales_proceso = []
-        comunas_unicas_processed = set()
-        registros_no_encontrados_api = 0
-
-        logs.append(f"=== ETL COMUNAS OPTIMIZADO INICIADO (Sensibilidad: {int(sensibilidad*100)}%) ===")
-
-        diccionario_obj, _ = DiccionarioReferencia.objects.get_or_create(
-            nombre="Comunas de Chile",
-            defaults={"descripcion": "Listado maestro de comunas normalizadas."}
-        )
-
-        cache_fuzz = {}
-
-        # Cargar diccionario oficial si viene el archivo (OPTIMIZADO SIN TIMEOUTS)
-        if archivo_oficial:
-            TerminoValido.objects.filter(diccionario=diccionario_obj).delete()
-            nuevos_terminos_oficiales = []
-            oficiales_unicos = set()
-
-            for linea_of in archivo_oficial:
-                linea_of_str = decodificar_linea(linea_of)
-                if linea_of_str and not "comuna" in linea_of_str.lower():
-                    comuna_of_norm = limpiar_texto_basico(linea_of_str)
-                    if comuna_of_norm not in oficiales_unicos:
-                        oficiales_unicos.add(comuna_of_norm)
-                        
-                        # Resuelve inmediato usando el nuevo motor híbrido sin congelar la red
-                        reg, hab = consultar_api_comuna(comuna_of_norm)
-                        
-                        cache_fuzz[comuna_of_norm] = (comuna_of_norm, reg, hab)
-                        
-                        nuevos_terminos_oficiales.append(
-                            TerminoValido(
-                                diccionario=diccionario_obj, 
-                                valor_oficial=comuna_of_norm,
-                                region=reg,
-                                habitantes=hab
-                            )
-                        )
-            if nuevos_terminos_oficiales:
-                TerminoValido.objects.bulk_create(nuevos_terminos_oficiales, batch_size=1000)
-
-        # Precargamos de la Base de Datos a la RAM
-        elementos_persistidos = TerminoValido.objects.filter(diccionario=diccionario_obj).values_list('valor_oficial', 'region', 'habitantes')
-        for val_oficial, region_bd, hab_bd in elementos_persistidos:
-            llave_busqueda = limpiar_texto_basico(val_oficial)
-            cache_fuzz[llave_busqueda] = (val_oficial, region_bd, hab_bd)
-
-        lista_oficial_bd = [item[0] for item in elementos_persistidos]
-        set_oficiales_existentes = set(lista_oficial_bd)
-        nuevos_registros_bd = []
-
-        # Determinar entrada de datos
-        lineas_a_procesar = []
-        if comuna_manual:
-            lineas_a_procesar = [comuna_manual]
-            total_lineas_leidas = 1
+        if api_http_contador[0] >= MAX_API_HTTP_POR_EJECUCION:
+            logs.append(
+                f"[{datetime.now().strftime('%X')}] AVISO: Límite de {MAX_API_HTTP_POR_EJECUCION} "
+                "consultas HTTP externas alcanzado; resto resuelto con diccionario local."
+            )
+        if errores:
+            logs.append(f"[{datetime.now().strftime('%X')}] Auditoría: {len(errores)} error(es) durante la ejecución.")
+            for err in errores:
+                logs.append(f"[{datetime.now().strftime('%X')}] ERROR: {err}")
         else:
-            for idx, linea in enumerate(archivo_sucio, start=1):
-                linea_str = decodificar_linea(linea)
-                if linea_str and not "comuna" in linea_str.lower():
-                    lineas_a_procesar.append(linea_str)
-            total_lineas_leidas = len(lineas_a_procesar)
-
-        # PROCESAMIENTO CON PROTECCIÓN DE BASE DE DATOS
-        for idx, linea_texto in enumerate(lineas_a_procesar, start=1):
-            comuna_limpia_inicial = limpiar_texto_basico(linea_texto)
-
-            if comuna_limpia_inicial in cache_fuzz:
-                comuna_final, reg, hab = cache_fuzz[comuna_limpia_inicial]
-            else:
-                comuna_final, corregido_fuzz = buscar_fuzz(comuna_limpia_inicial, lista_oficial_bd, cutoff=sensibilidad)
-                
-                comuna_final_limpia = limpiar_texto_basico(comuna_final)
-                if comuna_final_limpia in cache_fuzz:
-                    _, reg, hab = cache_fuzz[comuna_final_limpia]
-                else:
-                    reg, hab = consultar_api_comuna(comuna_final)
-                    if reg == "No Encontrada":
-                        registros_no_encontrados_api += 1
-                
-                cache_fuzz[comuna_limpia_inicial] = (comuna_final, reg, hab)
-
-            if comuna_final in comunas_unicas_processed:
-                continue
-
-            comunas_unicas_processed.add(comuna_final)
-
-            comunas_finales_proceso.append({
-                "id": idx, 
-                "valor_oficial": comuna_final,
-                "region": reg,
-                "habitantes": hab
-            })
-
-            # 🌟 FILTRO DE SEGURIDAD MÁXIMO: Solo persistimos en Postgres si es una comuna real encontrada
-            if reg != "No Encontrada" and comuna_final not in set_oficiales_existentes:
-                set_oficiales_existentes.add(comuna_final)
-                nuevos_registros_bd.append(
-                    TerminoValido(
-                        diccionario=diccionario_obj, 
-                        valor_oficial=comuna_final,
-                        region=reg,
-                        habitantes=hab
-                    )
-                )
-
-        if nuevos_registros_bd:
-            TerminoValido.objects.bulk_create(nuevos_registros_bd, batch_size=1000)
-
-        # AUDITORÍA DE LOGS
-        total_unicas = len(comunas_unicas_processed)
-        total_duplicados = total_lineas_leidas - total_unicas
-
-        logs.append(f"[{datetime.now().strftime('%X')}] Auditoría: Se leyeron {total_lineas_leidas} registros.")
-        logs.append(f"[{datetime.now().strftime('%X')}] Auditoría: Se procesaron {total_unicas} comunas únicas.")
-        logs.append(f"[{datetime.now().strftime('%X')}] Auditoría: Se eliminaron {total_duplicados} registros duplicados.")
-        logs.append(f"[{datetime.now().strftime('%X')}] Auditoría: Se consolidaron {len(comunas_finales_proceso)} registros correctamente.")
-        logs.append(f"[{datetime.now().strftime('%X')}] Auditoría: {registros_no_encontrados_api} registros no encontrados en la fuente oficial.")
-
-        # Re-ordenamos la respuesta según las preferencias de orden del Frontend
-        if debe_ordenar:
-            comunas_finales_proceso.sort(key=lambda x: x["valor_oficial"])
-
-        # Paginación protectora de memoria RAM en Render para el Dataset Masivo
-        data_respuesta = comunas_finales_proceso[:100]
+            logs.append(f"[{datetime.now().strftime('%X')}] Auditoría: 0 errores durante la ejecución.")
 
         t_total = time.time() - t_inicio
-        logs.append(f"=== ETL COMUNAS FINALIZADO EXITOSAMENTE EN {t_total:.2f} SEGUNDOS ===")
+        logs.append(
+            f"=== ETL COMUNAS FINALIZADO {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} "
+            f"({t_total:.2f} s) ==="
+        )
 
-        return Response({"logs": logs, "data": data_respuesta})
+        nombres_unicos = sorted(comunas_finales_proceso) if debe_ordenar else list(dict.fromkeys(comunas_finales_proceso))
+        ids_bd = {
+            t.valor_oficial: t.id
+            for t in TerminoValido.objects.filter(
+                diccionario=diccionario_obj,
+                valor_oficial__in=set(comunas_finales_proceso),
+            ).only("id", "valor_oficial")
+        }
 
-"""
+        data_completa = [
+            self._fila_comuna_respuesta(nombre, cache_fuzz, ids_bd.get(nombre))
+            for nombre in nombres_unicos
+        ]
+        data_vista_previa = data_completa
+        auditoria = {
+            "fecha_hora": inicio_dt.strftime('%Y-%m-%d %H:%M:%S'),
+            "registros_leidos": total_lineas_leidas,
+            "comunas_procesadas": total_unicas,
+            "duplicados_eliminados": total_duplicados,
+            "consolidados": total_unicas,
+            "no_encontrados": registros_no_encontrados_api,
+            "errores": len(errores),
+            "formato_texto": formato,
+        }
+
+        return Response({
+            "logs": logs,
+            "data": data_vista_previa,
+            "data_completa": data_completa,
+            "total_exportacion": len(data_completa),
+            "total_unicas": len(data_completa),
+            "auditoria": auditoria,
+            "needs_confirmation": False,
+        })

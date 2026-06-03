@@ -23,7 +23,7 @@ SECRET_KEY = os.environ.get('SECRET_KEY', 'django-insecure-clave-de-respaldo-loc
 
 # SECURITY WARNING: don't run with debug turned on in production!
 # En producción se apaga automáticamente para proteger el servidor
-DEBUG = os.environ.get('RENDER', 'False') == 'True' or False
+DEBUG = os.environ.get('DEBUG', 'True').lower() in ('true', '1', 'yes')
 
 ALLOWED_HOSTS = ['*']
 
@@ -80,7 +80,7 @@ DATABASES = {
         # Busca la variable en el entorno. Si no existe, usa SQLite
         default=os.environ.get('DATABASE_URL', f"sqlite:///{os.path.join(BASE_DIR, 'db.sqlite3')}"),
         conn_max_age=600,
-        ssl_require=True
+        ssl_require=False
     )
 }
 
