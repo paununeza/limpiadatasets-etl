@@ -80,7 +80,7 @@ DATABASES = {
         # Busca la variable en el entorno. Si no existe, usa SQLite
         default=os.environ.get('DATABASE_URL', f"sqlite:///{os.path.join(BASE_DIR, 'db.sqlite3')}"),
         conn_max_age=600,
-        ssl_require=False
+        ssl_require=True
     )
 }
 
