@@ -243,11 +243,87 @@ def quitar_tildes(texto):
     return "".join(c for c in descompuesto if not unicodedata.combining(c))
 
 def aplanar_comuna(texto):
+    """
+    Convierte un texto a su forma plana (minúsculas, sin tildes, sin espacios extra).
+    Versión CORREGIDA que maneja correctamente la ñ.
+    """
     if not texto:
         return ""
-    return quitar_tildes(texto).strip().lower()
+    # Quitar tildes y caracteres especiales
+    sin_tildes = quitar_tildes(texto)
+    # La ñ a veces no es capturada por quitar_tildes, la manejamos explícitamente
+    sin_tildes = sin_tildes.replace('ñ', 'n').replace('Ñ', 'N')
+    # Eliminar espacios múltiples y convertir a minúsculas
+    sin_espacios = re.sub(r'\s+', ' ', sin_tildes)
+    return sin_espacios.strip().lower()
+
+def normalizar_comuna(texto, formato='title', lista_oficial=None, usar_fuzzy=True, umbral_fuzzy=0.75):
+    """
+    Función ÚNICA y principal para normalizar el nombre de una comuna chilena.
+
+    Parámetros:
+    - texto: str, el nombre de la comuna a normalizar (puede tener errores, códigos, etc.)
+    - formato: str, 'title', 'upper' o 'lower'
+    - lista_oficial: list, lista de nombres oficiales válidos (opcional)
+    - usar_fuzzy: bool, si debe usar coincidencia difusa (para modo rápido desactivar)
+    - umbral_fuzzy: float, umbral para coincidencia difusa (0.5 a 0.95)
+    """
+    if not texto:
+        return ""
+    
+    # ============================================================
+    # PASO 1: Limpieza básica
+    # ============================================================
+    # Extraer nombre de comuna eliminando códigos numéricos
+    nombre_extraido = extraer_nombre_comuna(texto)
+    
+    # Aplicar formato básico (sin fuzzy aún)
+    nombre_formateado = aplicar_formato_texto(nombre_extraido, formato)
+    
+    # Forma plana para comparaciones
+    plano = aplanar_comuna(nombre_formateado)
+    
+    # ============================================================
+    # PASO 2: Resolver alias conocidos (ej: 'arauoc' -> 'arauco')
+    # ============================================================
+    if plano in ALIAS_COMUNAS:
+        alias_resuelto = ALIAS_COMUNAS[plano]
+        return aplicar_formato_texto(alias_resuelto, formato)
+    
+    # ============================================================
+    # PASO 3: Coincidencia exacta contra lista oficial (si existe)
+    # ============================================================
+    if lista_oficial:
+        # Construir mapa de forma plana a nombre oficial
+        mapa_plano_a_oficial = {}
+        for oficial in lista_oficial:
+            plano_oficial = aplanar_comuna(oficial)
+            if plano_oficial not in mapa_plano_a_oficial:
+                mapa_plano_a_oficial[plano_oficial] = oficial
+        
+        # Coincidencia exacta
+        if plano in mapa_plano_a_oficial:
+            return aplicar_formato_texto(mapa_plano_a_oficial[plano], formato)
+        
+        # ============================================================
+        # PASO 4: Coincidencia difusa (solo si está habilitada)
+        # ============================================================
+        if usar_fuzzy:
+            # Buscar coincidencias en las formas planas
+            claves_planas = list(mapa_plano_a_oficial.keys())
+            coincidencias = difflib.get_close_matches(plano, claves_planas, n=1, cutoff=umbral_fuzzy)
+            
+            if coincidencias:
+                mejor_coincidencia = mapa_plano_a_oficial[coincidencias[0]]
+                return aplicar_formato_texto(mejor_coincidencia, formato)
+    
+    # ============================================================
+    # PASO 5: Fallback - devolver el nombre limpio con formato
+    # ============================================================
+    return nombre_formateado
 
 def construir_corpus_comunas(lista_referencia=None):
+    """Mantenida por compatibilidad - ya no se usa para fuzzy matching."""
     corpus = set(MAPEO_CHILE.keys())
     if lista_referencia:
         for item in lista_referencia:
@@ -296,56 +372,6 @@ def resolver_alias_comuna(plano):
         return ALIAS_COMUNAS[plano]
     return ALIAS_COMUNAS.get(_compactar_clave_comuna(plano))
 
-def _fuzzy_match_corpus(plano, corpus, cutoff=0.80):
-    """Busca la mejor coincidencia difusa en el corpus (plano y sin espacios)."""
-    if plano in corpus:
-        return plano
-
-    # PRIORIDAD 1: el alias ya debió resolverlo; si llegamos aquí sin alias,
-    # preferir candidatos donde el input sea subcadena exacta del nombre oficial
-    # (ej. 'calera' ⊂ 'la calera') antes de dejar que difflib elija 'caldera'.
-    subcadena_directa = [c for c in corpus if plano == c or plano in c.split()]
-    if len(subcadena_directa) == 1:
-        return subcadena_directa[0]
-
-    coincidencias = difflib.get_close_matches(plano, list(corpus), n=1, cutoff=cutoff)
-    if coincidencias:
-        return coincidencias[0]
-
-    corpus_compacto = {c.replace(' ', ''): c for c in corpus}
-    plano_compacto = plano.replace(' ', '')
-    if len(plano_compacto) >= 4:
-        if plano_compacto in corpus_compacto:
-            return corpus_compacto[plano_compacto]
-        claves_compactas = list(corpus_compacto.keys())
-        coincidencias = difflib.get_close_matches(
-            plano_compacto, claves_compactas, n=1, cutoff=cutoff
-        )
-        if coincidencias:
-            return corpus_compacto[coincidencias[0]]
-
-    return None
-
-def reparar_nombre_comuna_danado(nombre, lista_referencia=None, corpus=None):
-    """Corrige nombres corruptos (Concepcin, E Ltabo) comparando con el mapeo y el listado oficial."""
-    limpio = quitar_tildes(extraer_nombre_comuna(nombre))
-    plano = aplanar_comuna(limpio)
-    if not plano:
-        return limpio
-
-    if corpus is None:
-        corpus = construir_corpus_comunas(lista_referencia)
-
-    alias = resolver_alias_comuna(plano)
-    if alias:
-        return alias
-
-    coincidencia = _fuzzy_match_corpus(plano, corpus, cutoff=0.80)
-    if coincidencia:
-        return coincidencia
-
-    return limpio
-
 def extraer_nombre_comuna(texto):
     """Quita códigos numéricos al inicio (listados INE): '10102 Calbuco' -> 'Calbuco'."""
     t = re.sub(r'\s+', ' ', (texto or '').strip())
@@ -354,8 +380,8 @@ def extraer_nombre_comuna(texto):
     return t
 
 def nombre_comuna_normalizado(texto, formato='title', lista_referencia=None, corpus=None):
-    base = reparar_nombre_comuna_danado(texto, lista_referencia=lista_referencia, corpus=corpus)
-    return aplicar_formato_texto(base, formato)
+    # El parámetro corpus ya no se usa, se mantiene por compatibilidad
+    return normalizar_comuna(texto, formato, lista_oficial=lista_referencia)
 
 # Censo / fuente estática — evita cientos de HTTP al cargar comunas.txt
 MAPEO_CHILE = {
@@ -704,11 +730,26 @@ MAPEO_CHILE = {
 }
 
 _cache_consulta_comuna = {}
+# =====================================================================
+# CONFIGURACIÓN DE RENDIMIENTO
+# =====================================================================
+
 MAX_API_HTTP_POR_EJECUCION = 30
-UMBRAL_MODO_RAPIDO = 150
+UMBRAL_MODO_RAPIDO = 150  # Si hay más de 150 líneas, activar modo rápido
 MAX_LOGS_DETALLE = 25
 
+UMBRAL_MODO_ULTRARRAPIDO = 1000  # Si hay más de 1000 líneas, modo extremo
+TIEMPO_MAXIMO_SEGUNDOS = 25  # Dejar 5 segundos de margen para el límite de 30s de Render
+CHUNK_SIZE = 500  # Procesar en bloques de 500 líneas para liberar memoria
+
 FORMATOS_TEXTO_VALIDOS = frozenset({'title', 'upper', 'lower'})
+
+def procesar_lotes_comunas(lineas, tamanio_lote=500):
+    """
+    Divide una lista en lotes más pequeños para procesamiento eficiente.
+    """
+    for i in range(0, len(lineas), tamanio_lote):
+        yield lineas[i:i + tamanio_lote]
 
 def aplicar_formato_texto(texto, formato='title'):
     """Normaliza espacios/tildes y aplica mayúsculas, minúsculas o título."""
@@ -753,76 +794,53 @@ def buscar_fuzz(texto_normalizado, lista_oficial, cutoff=0.75, formato='title'):
         return aplicar_formato_texto(oficial, formato), True
     return texto_normalizado, False
 
-def buscar_candidatos_comuna(texto_raw, lista_oficial, cutoff=0.75, formato='title', lista_referencia=None, corpus=None):
-    """Devuelve hasta 5 comunas candidatas ordenadas por similitud (rápido con difflib)."""
-    texto_norm = quitar_tildes((texto_raw or '').strip()).lower()
-    if not texto_norm:
+def buscar_candidatos_comuna(texto_raw, lista_oficial, cutoff=0.75, formato='title', max_candidatos=5):
+    """
+    Busca múltiples candidatos para desambiguación.
+    Versión refactorizada sin recursión.
+    """
+    if not texto_raw:
         return []
-
+    
     if not lista_oficial:
-        unico = aplicar_formato_texto(texto_raw, formato)
-        return [{"nombre": unico, "score": 1.0}] if unico else []
-
-    claves_unicas = {}
-    for nombre in lista_oficial:
-        clave = nombre_comuna_normalizado(nombre, formato, corpus=corpus)
-        if clave not in claves_unicas:
-            claves_unicas[clave] = clave
-
-    claves = list(claves_unicas.keys())
-    texto_clave = nombre_comuna_normalizado(texto_raw, formato, corpus=corpus)
-    umbral = max(cutoff - 0.05, 0.65)
-
-    mapa_plano = {}
-    mapa_compacto = {}
-    for clave in claves:
-        plano = aplanar_comuna(clave)
-        mapa_plano[plano] = clave
-        mapa_compacto[plano.replace(' ', '')] = clave
-
-    texto_plano = aplanar_comuna(texto_clave)
-    claves_planas = list(mapa_plano.keys())
-    matches_planos = difflib.get_close_matches(texto_plano, claves_planas, n=5, cutoff=umbral)
-
-    if not matches_planos and len(texto_plano.replace(' ', '')) >= 4:
-        texto_compacto = texto_plano.replace(' ', '')
-        matches_planos = difflib.get_close_matches(
-            texto_compacto, list(mapa_compacto.keys()), n=5, cutoff=umbral
-        )
-        matches = [mapa_compacto[m] for m in matches_planos]
-    else:
-        matches = [mapa_plano[m] for m in matches_planos]
-
+        texto_norm = normalizar_comuna(texto_raw, formato, usar_fuzzy=False)
+        return [{"nombre": texto_norm, "score": 1.0}] if texto_norm else []
+    
+    texto_plano = aplanar_comuna(extraer_nombre_comuna(texto_raw))
+    
+    # Construir mapa de formas planas a oficiales
+    mapa_plano_a_oficial = {}
+    for oficial in lista_oficial:
+        plano_oficial = aplanar_comuna(oficial)
+        if plano_oficial not in mapa_plano_a_oficial:
+            mapa_plano_a_oficial[plano_oficial] = oficial
+    
+    # Verificar alias primero
+    if texto_plano in ALIAS_COMUNAS:
+        alias_resuelto = ALIAS_COMUNAS[texto_plano]
+        texto_plano = aplanar_comuna(alias_resuelto)
+    
+    # Buscar coincidencias difusas
+    claves_planas = list(mapa_plano_a_oficial.keys())
+    coincidencias = difflib.get_close_matches(texto_plano, claves_planas, n=max_candidatos, cutoff=cutoff)
+    
     candidatos = []
-    vistos = set()
-    for clave in matches:
-        key_norm = quitar_tildes(clave).lower()
-        ratio = difflib.SequenceMatcher(None, texto_norm, key_norm).ratio()
-        candidatos.append({"nombre": clave, "score": round(ratio, 2)})
-        vistos.add(clave)
-
-    for clave in claves:
-        key_norm = quitar_tildes(clave).lower()
-        key_compacto = key_norm.replace(' ', '')
-        texto_compacto = texto_norm.replace(' ', '')
-        if clave in vistos:
-            continue
-        if texto_norm in key_norm or key_norm in texto_norm:
-            candidatos.append({"nombre": clave, "score": 0.88})
-            vistos.add(clave)
-        elif len(texto_compacto) >= 4 and (
-            texto_compacto in key_compacto or key_compacto in texto_compacto
-        ):
-            candidatos.append({"nombre": clave, "score": 0.86})
-            vistos.add(clave)
-
-    candidatos.sort(key=lambda x: (-x["score"], x["nombre"]))
-    if not candidatos:
-        return [{
-            "nombre": nombre_comuna_normalizado(texto_raw, formato, corpus=corpus),
-            "score": 0.5,
-        }]
-    return candidatos[:5]
+    for clave in coincidencias:
+        oficial = mapa_plano_a_oficial[clave]
+        # Calcular score de similitud
+        score = difflib.SequenceMatcher(None, texto_plano, clave).ratio()
+        candidatos.append({
+            "nombre": aplicar_formato_texto(oficial, formato),
+            "score": round(score, 2)
+        })
+    
+    # Si no hay coincidencias difusas, devolver al menos una sugerencia
+    if not candidatos and lista_oficial:
+        # Devolver la primera de la lista como fallback
+        primer_oficial = aplicar_formato_texto(lista_oficial[0], formato)
+        candidatos.append({"nombre": primer_oficial, "score": 0.5})
+    
+    return candidatos
 
 def es_busqueda_ambigua(candidatos, margen=0.08):
     """Detecta empate difuso o nombres compartidos (ej. florida vs la florida).
@@ -849,6 +867,46 @@ def enriquecer_candidatos_comuna(candidatos):
             "habitantes": hab,
         })
     return enriquecidos
+
+class SugerenciasComunaView(APIView):
+    """Endpoint para autocompletar comunas mientras el usuario escribe."""
+    
+    def get(self, request):
+        query = request.query_params.get('q', '').strip()
+        limit = int(request.query_params.get('limit', 5))
+        
+        if len(query) < 2:
+            return Response({"sugerencias": []})
+        
+        # Buscar en MAPEO_CHILE y en cache
+        resultados = []
+        query_lower = query.lower()
+        
+        # Primero, búsqueda exacta por inicio de palabra
+        for comuna, (region, habitantes) in MAPEO_CHILE.items():
+            if comuna.startswith(query_lower) or query_lower in comuna:
+                resultados.append({
+                    "nombre": comuna.title(),
+                    "region": region,
+                    "habitantes": habitantes,
+                    "tipo": "exacta"
+                })
+        
+        # Segundo, búsqueda difusa
+        if len(resultados) < limit:
+            todas_comunas = list(MAPEO_CHILE.keys())
+            coincidencias = difflib.get_close_matches(query_lower, todas_comunas, n=limit, cutoff=0.6)
+            for comuna in coincidencias:
+                if not any(r["nombre"].lower() == comuna for r in resultados):
+                    region, habitantes = MAPEO_CHILE[comuna]
+                    resultados.append({
+                        "nombre": comuna.title(),
+                        "region": region,
+                        "habitantes": habitantes,
+                        "tipo": "difusa"
+                    })
+        
+        return Response({"sugerencias": resultados[:limit]})
 
 # =====================================================================
 # PROCESADOR DE FAMOSOS
@@ -1266,12 +1324,12 @@ class ProcesarComunasView(APIView):
     parser_classes = [MultiPartParser]
 
     def _resolver_comuna(self, linea_texto, idx, lista_oficial_bd, cache_fuzz, sensibilidad, formato,
-                         comunas_unicas_processed, comuna_confirmada=None, api_http_contador=None,
-                         modo_rapido=False, corpus=None, claves_oficiales=None, contadores=None):
-        """Resuelve una línea a (comuna_final, reg, hab, logs_parciales, no_encontrado)."""
+                     comunas_unicas_processed, comuna_confirmada=None, api_http_contador=None,
+                     modo_rapido=False, corpus=None, claves_oficiales=None, contadores=None):
+        """Resuelve una línea a (comuna_final, reg, hab, logs_parciales, no_encontrado, ya_procesada)"""
         logs_parciales = []
-        no_encontrado = False
         contadores = contadores or {}
+        no_encontrado = False
 
         if comuna_confirmada:
             comuna_final = nombre_comuna_normalizado(comuna_confirmada, formato, corpus=corpus)
@@ -1281,18 +1339,15 @@ class ProcesarComunasView(APIView):
                     f"'{linea_texto}' -> '{comuna_final}'."
                 )
         else:
-            # PASO 1: resolver alias conocidos ANTES de cualquier fuzzy
-            # Esto garantiza que 'arauoc'→'arauco', 'l acalera'→'calera', etc.
-            # funcionen incluso en modo rápido y con sensibilidad alta.
-            plano_entrada = aplanar_comuna(extraer_nombre_comuna(linea_texto) or linea_texto)
-            alias_resuelto = resolver_alias_comuna(plano_entrada)
-            texto_para_buscar = alias_resuelto if alias_resuelto else (extraer_nombre_comuna(linea_texto) or linea_texto)
-
+            #  SOLO CAMBIO: en modo rápido, usar sensibilidad más alta (menos fuzzy)
+            sensibilidad_efectiva = sensibilidad + 0.10 if modo_rapido else sensibilidad
+            sensibilidad_efectiva = min(sensibilidad_efectiva, 0.95)  # Máximo 95%
+            
             inicial_fmt = nombre_comuna_normalizado(linea_texto, formato, corpus=corpus)
             candidatos = buscar_candidatos_comuna(
-                texto_para_buscar,
+                linea_texto,
                 lista_oficial_bd,
-                cutoff=sensibilidad,
+                cutoff=sensibilidad_efectiva,  # Usar sensibilidad ajustada
                 formato=formato,
                 corpus=corpus,
             )
@@ -1313,22 +1368,22 @@ class ProcesarComunasView(APIView):
                         f"[{datetime.now().strftime('%X')}][LÍNEA {idx}] FUZZ CORRECCIÓN: "
                         f"'{linea_texto}' -> '{comuna_final}'."
                     )
-                elif contadores.get("fuzz_log", 0) < MAX_LOGS_DETALLE:
-                    logs_parciales.append(
-                        f"[{datetime.now().strftime('%X')}][LÍNEA {idx}] FUZZ: '{linea_texto}' -> '{comuna_final}'."
-                    )
-                    contadores["fuzz_log"] = contadores.get("fuzz_log", 0) + 1
 
         comuna_final = nombre_comuna_normalizado(comuna_final, formato, corpus=corpus)
         llave_cache = comuna_final
         if llave_cache in cache_fuzz:
             comuna_final, reg, hab = cache_fuzz[llave_cache]
         else:
-            reg, hab = consultar_api_comuna(comuna_final, usar_red=False)
-            if reg == "No Encontrada":
-                no_encontrado = True
-                contadores["sin_dato"] = contadores.get("sin_dato", 0) + 1
+            # SOLO CAMBIO: en modo rápido, NO consultar API externa
+            usar_red = not modo_rapido
+            reg, hab = consultar_api_comuna(comuna_final, usar_red=usar_red)
+            if usar_red and reg != "No Encontrada" and api_http_contador:
+                api_http_contador[0] += 1
             cache_fuzz[llave_cache] = (comuna_final, reg, hab)
+
+        if reg == "No Encontrada":
+            no_encontrado = True
+            contadores["sin_dato"] = contadores.get("sin_dato", 0) + 1
 
         if comuna_final in comunas_unicas_processed:
             contadores["dup"] = contadores.get("dup", 0) + 1
@@ -1339,6 +1394,7 @@ class ProcesarComunasView(APIView):
             return comuna_final, reg, hab, logs_parciales, no_encontrado, True
 
         return comuna_final, reg, hab, logs_parciales, no_encontrado, False
+
 
     def _fila_comuna_respuesta(self, nombre, cache_fuzz, id_registro=None):
         _, reg, hab = cache_fuzz.get(nombre, (nombre, "No Encontrada", None))
@@ -1409,8 +1465,14 @@ class ProcesarComunasView(APIView):
         # Pre-cargar cache_fuzz con MAPEO_CHILE interno siempre.
         # Esto garantiza que arauco, calera, san fernando, etc. estén disponibles
         # incluso cuando el diccionario en BD fue poblado con una versión anterior.
+        # Precargar cache_fuzz con MAPEO_CHILE usando el nuevo normalizador
         for nombre_mapa, (region_mapa, hab_mapa) in MAPEO_CHILE.items():
-            clave_fmt = aplicar_formato_texto(nombre_mapa, formato)
+            clave_fmt = normalizar_comuna(
+                nombre_mapa, 
+                formato=formato, 
+                lista_oficial=None,  # No usar lista oficial aún
+                usar_fuzzy=False
+            )
             cache_fuzz[clave_fmt] = (clave_fmt, region_mapa, hab_mapa)
 
         if archivo_oficial:
@@ -1550,26 +1612,61 @@ class ProcesarComunasView(APIView):
 
         contadores = {}
         confirmada = comuna_confirmada if comuna_manual else None
+
+        # ======
+        lineas_a_procesar = []
+        if comuna_manual:
+            lineas_a_procesar = [comuna_manual]
+            total_lineas_leidas = 1
+        else:
+            for linea in archivo_sucio:
+                linea_str = decodificar_linea(linea)
+                if linea_str and "comuna" not in linea_str.lower():
+                    lineas_a_procesar.append(linea_str)
+            total_lineas_leidas = len(lineas_a_procesar)
+
+        # determinar modo rápido
+        modo_rapido = total_lineas_leidas > UMBRAL_MODO_RAPIDO and not comuna_manual
+
+        if modo_rapido:
+            logs.append(f"[{datetime.now().strftime('%X')}] MODO RÁPIDO activado ({total_lineas_leidas} líneas)")
+
+        # procesar con control de tiempo
+        tiempo_inicio_procesamiento = time.time()
+        comunas_unicas_processed = set()  # Asegurar que existe esta variable
+        contadores = {}
+
         for idx, linea_texto in enumerate(lineas_a_procesar, start=1):
+            
+            # verificar tiempo cada 100 líneas (no cada línea para no afectar rendimiento)
+            if idx % 100 == 0:
+                tiempo_transcurrido = time.time() - tiempo_inicio_procesamiento
+                if tiempo_transcurrido > TIEMPO_MAXIMO_SEGUNDOS:
+                    logs.append(
+                        f"[{datetime.now().strftime('%X')}] Timeout: {len(comunas_unicas_processed)} de {total_lineas_leidas} líneas procesadas."
+                    )
+                    break
+            
+
             resultado = self._resolver_comuna(
                 linea_texto, idx, lista_oficial_bd, cache_fuzz, sensibilidad, formato,
                 comunas_unicas_processed, comuna_confirmada=confirmada,
-                api_http_contador=api_http_contador,
-                modo_rapido=modo_rapido,
-                corpus=corpus,
-                claves_oficiales=claves_oficiales if lista_oficial_bd else None,
-                contadores=contadores,
+                api_http_contador=api_http_contador, modo_rapido=modo_rapido,  #  Pasar modo_rapido
+                corpus=corpus, contadores=contadores
             )
             comuna_final, reg, hab, logs_parciales, no_encontrado, ya_procesada = resultado
+            
             logs.extend(logs_parciales)
+            
             if no_encontrado:
                 registros_no_encontrados_api += 1
+            
             if ya_procesada:
                 continue
-
+            
             comunas_unicas_processed.add(comuna_final)
             comunas_finales_proceso.append(comuna_final)
-
+            
             if reg != "No Encontrada" and comuna_final not in set_oficiales_existentes:
                 set_oficiales_existentes.add(comuna_final)
                 nuevos_registros_bd.append(

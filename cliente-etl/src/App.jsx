@@ -63,6 +63,9 @@ export default function App() {
   const [formatoTexto, setFormatoTexto] = useState('title'); // title | upper | lower
   const [sugerenciasComuna, setSugerenciasComuna] = useState([]);
   const [auditoria, setAuditoria] = useState(null);
+const [sugerenciasBusqueda, setSugerenciasBusqueda] = useState([]);
+const [mostrarSugerencias, setMostrarSugerencias] = useState(false);
+
 
   const [famosoSeleccionado, setFamosoSeleccionado] = useState(null); // Guardaremos el objeto completo
   const [urlImagenFamoso, setUrlImagenFamoso] = useState(null);
@@ -81,6 +84,25 @@ export default function App() {
   const [cargandoLugares, setCargandoLugares] = useState(false);
   const [errorLugares, setErrorLugares] = useState('');
   const [ajustarVistaMapa, setAjustarVistaMapa] = useState(0);
+
+  // Función para buscar sugerencias mientras escribe
+  const buscarSugerenciasComuna = async (texto) => {
+    if (!texto.trim() || texto.length < 3) {
+      setSugerenciasBusqueda([]);
+      setMostrarSugerencias(false);
+      return;
+    }
+    
+    try {
+      const response = await axios.get(apiUrl('comunas/sugerencias/'), {
+        params: { q: texto, limit: 5 }
+      });
+      setSugerenciasBusqueda(response.data.sugerencias || []);
+      setMostrarSugerencias(true);
+    } catch (error) {
+      console.error("Error al buscar sugerencias:", error);
+    }
+  };
 
   const lugaresConCoordenadas = useMemo(
     () => datosResultado.filter((l) => extraerCoordenadas(l.georeferencia)),
@@ -478,13 +500,76 @@ export default function App() {
                 Búsqueda Manual - Ingresar comuna:
               </label>
               <div style={{ display: 'flex', gap: '8px' }}>
-                <input 
-                  type="text" 
-                  value={comunaManual} 
-                  onChange={(e) => { setComunaManual(e.target.value); setArchivo(null); }}
-                  placeholder="Ej: florida, santiago centro, conce" 
-                  style={{ flex: 1, padding: '6px', borderRadius: '4px', border: '1px solid #4b5563', backgroundColor: '#111827', color: 'white' }}
-                />
+                <div style={{ position: 'relative' }}>
+                    <input 
+                      type="text" 
+                      value={comunaManual} 
+                      onChange={(e) => { 
+                        setComunaManual(e.target.value); 
+                        setArchivo(null);
+                        buscarSugerenciasComuna(e.target.value);
+                      }}
+                      onFocus={() => comunaManual.length >= 3 && setMostrarSugerencias(true)}
+                      onBlur={() => {
+                        // Delay para permitir click en sugerencias
+                        setTimeout(() => setMostrarSugerencias(false), 200);
+                      }}
+                      placeholder="Ej: florida, santiago centro, conce" 
+                      style={{ 
+                        flex: 1, 
+                        padding: '8px 12px', 
+                        borderRadius: '6px', 
+                        border: '1px solid #4b5563', 
+                        backgroundColor: '#111827', 
+                        color: 'white',
+                        fontSize: '14px'
+                      }}
+                    />
+                    
+                    {/* Dropdown de sugerencias */}
+                    {mostrarSugerencias && sugerenciasBusqueda.length > 0 && (
+                      <div style={{
+                        position: 'absolute',
+                        top: '100%',
+                        left: 0,
+                        right: 0,
+                        backgroundColor: '#1f2937',
+                        border: '1px solid #4b5563',
+                        borderRadius: '6px',
+                        marginTop: '4px',
+                        zIndex: 1000,
+                        maxHeight: '250px',
+                        overflowY: 'auto'
+                      }}>
+                        {sugerenciasBusqueda.map((sug) => (
+                          <div
+                            key={sug.nombre}
+                            onClick={() => {
+                              setComunaManual(sug.nombre);
+                              setMostrarSugerencias(false);
+                              setSugerenciasBusqueda([]);
+                              // Opcional: procesar automáticamente
+                              // ejecutarETL(null, true);
+                            }}
+                            style={{
+                              padding: '10px 12px',
+                              cursor: 'pointer',
+                              borderBottom: '1px solid #374151',
+                              display: 'flex',
+                              justifyContent: 'space-between',
+                              alignItems: 'center'
+                            }}
+                            onMouseEnter={(e) => e.currentTarget.style.backgroundColor = '#374151'}
+                            onMouseLeave={(e) => e.currentTarget.style.backgroundColor = 'transparent'}
+                          >
+                            <div>
+                              <span style={{ color: 'white', fontWeight: 'bold' }}>{sug.nombre}</span>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
                 <button 
                   type="button" 
                   onClick={(e) => ejecutarETL(e, true)} 
@@ -518,7 +603,6 @@ export default function App() {
                         }}
                       >
                         {s.nombre}
-                        {s.region && s.region !== 'No Encontrada' ? ` (${s.region})` : ' (sin región)'}
                       </button>
                     ))}
                   </div>
