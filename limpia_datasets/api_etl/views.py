@@ -860,7 +860,7 @@ def es_busqueda_ambigua(candidatos, margen=0.08):
 def enriquecer_candidatos_comuna(candidatos):
     enriquecidos = []
     for cand in candidatos:
-        reg, hab = consultar_api_comuna(cand["nombre"])
+        reg, hab = consultar_api_comuna(cand["nombre"], usar_red=False)
         enriquecidos.append({
             **cand,
             "region": reg,
@@ -1349,7 +1349,6 @@ class ProcesarComunasView(APIView):
                 lista_oficial_bd,
                 cutoff=sensibilidad_efectiva,  # Usar sensibilidad ajustada
                 formato=formato,
-                corpus=corpus,
             )
             if len(candidatos) > 1 and es_busqueda_ambigua(candidatos):
                 contadores["ambig"] = contadores.get("ambig", 0) + 1
@@ -1565,7 +1564,6 @@ class ProcesarComunasView(APIView):
                     lista_oficial_bd,
                     cutoff=sensibilidad,
                     formato=formato,
-                    corpus=corpus,
                 )
             )
             if len(candidatos) > 1 and es_busqueda_ambigua(candidatos):
@@ -1613,28 +1611,12 @@ class ProcesarComunasView(APIView):
         contadores = {}
         confirmada = comuna_confirmada if comuna_manual else None
 
-        # ======
-        lineas_a_procesar = []
-        if comuna_manual:
-            lineas_a_procesar = [comuna_manual]
-            total_lineas_leidas = 1
-        else:
-            for linea in archivo_sucio:
-                linea_str = decodificar_linea(linea)
-                if linea_str and "comuna" not in linea_str.lower():
-                    lineas_a_procesar.append(linea_str)
-            total_lineas_leidas = len(lineas_a_procesar)
-
         # determinar modo rápido
-        modo_rapido = total_lineas_leidas > UMBRAL_MODO_RAPIDO and not comuna_manual
-
         if modo_rapido:
             logs.append(f"[{datetime.now().strftime('%X')}] MODO RÁPIDO activado ({total_lineas_leidas} líneas)")
 
         # procesar con control de tiempo
         tiempo_inicio_procesamiento = time.time()
-        comunas_unicas_processed = set()  # Asegurar que existe esta variable
-        contadores = {}
 
         for idx, linea_texto in enumerate(lineas_a_procesar, start=1):
             
